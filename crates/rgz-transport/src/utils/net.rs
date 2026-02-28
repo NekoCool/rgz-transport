@@ -98,6 +98,8 @@ pub fn username() -> String {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "network-tests")]
+    #[ignore = "requires network"]
     #[test]
     fn test_hostname_to_ip() {
         let hostname = hostname();

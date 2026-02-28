@@ -327,6 +327,8 @@ mod tests {
 
     use super::*;
 
+    #[cfg(feature = "network-tests")]
+    #[ignore = "requires network"]
     #[tokio::test]
     async fn test_pub_sub() {
         let topic = "/foo";
@@ -360,6 +362,8 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "network-tests")]
+    #[ignore = "requires network"]
     #[tokio::test]
     async fn test_pub_sub_stream() {
         let topic = "/foo";
@@ -390,6 +394,8 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "network-tests")]
+    #[ignore = "requires network"]
     #[tokio::test]
     async fn test_req_res() {
         let topic = "/echo";
@@ -413,6 +419,8 @@ mod tests {
         assert_eq!(string_msg.data, "HELLO".to_string());
     }
 
+    #[cfg(feature = "network-tests")]
+    #[ignore = "requires network"]
     #[tokio::test]
     async fn test_req_res_error() {
         tracing_subscriber::fmt()
