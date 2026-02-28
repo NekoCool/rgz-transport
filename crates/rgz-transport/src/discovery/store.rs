@@ -469,7 +469,13 @@ mod tests {
         assert_eq!(result.is_err(), true);
 
         let pubs = store.publishers(None, None, None);
-        assert_eq!(pubs.len(), 1);
+        assert_eq!(pubs.len(), 2);
+        assert!(pubs
+            .iter()
+            .any(|p| p.topic == "topic1" && p.process_uuid == "p_uuid1" && p.node_uuid == "n_uuid2"));
+        assert!(pubs
+            .iter()
+            .any(|p| p.topic == "topic2" && p.process_uuid == "p_uuid1" && p.node_uuid == "n_uuid1"));
     }
 
     #[test]
