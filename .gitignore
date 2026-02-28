@@ -15,4 +15,8 @@ Cargo.lock
 # MSVC Windows builds of rustc generate these, which store debugging information
 *.pdb
 
+<<<<<<< HEAD
 scripts/tmp/*
+=======
+scripts/tmp/
+>>>>>>> fd3cb9f (fix: add scripts/tmp to .gitignore)
