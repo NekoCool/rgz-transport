@@ -7,7 +7,10 @@ use rgz_transport::Node;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env::set_var("GZ_IP", "172.17.0.1");
+    // Rust 2024: mutating process-wide environment is unsafe.
+    unsafe {
+        env::set_var("GZ_IP", "172.17.0.1");
+    }
 
     let topic = "/foo";
     let mut node = Node::new(None);

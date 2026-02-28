@@ -181,7 +181,7 @@ impl Discovery {
         }
 
         // Only advertise a message outside this process if the scope is not 'Process'
-        let scope = DiscoveryScope::from_i32(discovery_publisher.scope);
+        let scope = DiscoveryScope::try_from(discovery_publisher.scope).ok();
         if scope.is_none() || scope == Some(DiscoveryScope::Process) {
             bail!("Only advertise a message if the scope is not 'Process'");
         }
@@ -676,7 +676,7 @@ impl DiscoveryInner {
 
         let is_sender_local = self.is_local_ip(from_ip);
 
-        let msg_type = DiscoveryType::from_i32(msg.r#type).unwrap_or(DiscoveryType::Uninitialized);
+        let msg_type = DiscoveryType::try_from(msg.r#type).unwrap_or(DiscoveryType::Uninitialized);
 
         // debug!("Received [{}] from [{}].", &msg_type.as_str_name(), &msg.process_uuid);
         match msg_type {
@@ -717,7 +717,7 @@ impl DiscoveryInner {
                         let mut v = vec![];
                         let store = self.discovery_store.lock().unwrap();
                         for p in store.publishers(Some(recv_topic), Some(&msg.process_uuid), None) {
-                            if let Some(scope) = DiscoveryScope::from_i32(p.scope) {
+                                if let Ok(scope) = DiscoveryScope::try_from(p.scope) {
                                 if scope == DiscoveryScope::Process
                                     || (scope == DiscoveryScope::Host && !is_sender_local)
                                 {
@@ -771,7 +771,7 @@ impl DiscoveryInner {
                 }
             }
             DiscoveryType::Unadvertise => {
-                if let Some(scope) = DiscoveryScope::from_i32(publisher.scope) {
+                if let Ok(scope) = DiscoveryScope::try_from(publisher.scope) {
                     if scope == DiscoveryScope::Process
                         || (scope == DiscoveryScope::Host && !is_sender_local)
                     {
