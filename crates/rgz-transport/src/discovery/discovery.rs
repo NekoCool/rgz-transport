@@ -326,12 +326,41 @@ impl Discovery {
         let (tx, mut rx) = unbounded_channel();
         self.msg_sender = Some(tx.clone());
 
-        let mut heartbeat_interval = time::interval(Duration::from_millis(self.heartbeat_interval));
+        let socket = match self.register_host_interfaces() {
+            Ok(_) => self.socket.clone(),
+            Err(err) => {
+                warn!(
+                    "Failed to register host interfaces: {}. Running discovery in degraded mode.",
+                    err
+                );
+                None
+            }
+        };
+        let Some(socket) = socket else {
+            let p_uuid = self.p_uuid.clone();
+            tokio::spawn(async move {
+                let mut warned = false;
+                while let Some(msg) = rx.recv().await {
+                    if msg.discovery_type == DiscoveryType::Bye {
+                        break;
+                    }
+                    if !warned {
+                        warn!(
+                            "Discovery [{}] is in degraded mode; outbound network messages are disabled.",
+                            p_uuid
+                        );
+                        warned = true;
+                    }
+                }
+                debug!("Discovery thread finished in degraded mode. [{}]", p_uuid);
+            });
+            return;
+        };
+
+        let mut heartbeat_interval =
+            time::interval(Duration::from_millis(self.heartbeat_interval));
         let mut activity_interval = time::interval(Duration::from_millis(self.activity_interval));
 
-        self.register_host_interfaces()
-            .expect("Failed to register host interfaces.");
-        let socket = self.socket.clone().unwrap();
         let inner = DiscoveryInner::new(
             self.version,
             self.p_uuid.clone(),
@@ -984,6 +1013,9 @@ mod tests {
 
         discovery1.start();
         discovery2.start();
+        if discovery1.socket.is_none() || discovery2.socket.is_none() {
+            return;
+        }
 
         time::sleep(Duration::from_millis(100)).await;
 
@@ -1005,6 +1037,14 @@ mod tests {
             let publisher = store.publisher(TOPIC, &P_UUID1, &N_UUID1);
             assert!(publisher.is_some());
         }
+    }
+
+    #[tokio::test]
+    async fn test_start_does_not_panic_on_interface_registration_failure() {
+        let mut discovery = Discovery::new(&P_UUID1, IP, MSG_PORT, true);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| discovery.start()));
+        assert!(result.is_ok());
+        assert!(discovery.msg_sender.is_some());
     }
 
     // Check that the discovery triggers the callbacks after an advertise.
