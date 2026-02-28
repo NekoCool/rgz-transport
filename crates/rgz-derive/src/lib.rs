@@ -18,10 +18,10 @@ fn impl_gz_message_macro(ast: &syn::DeriveInput) -> TokenStream {
     let replace_name = re.replace(&name_str, "_V").to_string();
     let type_name = format!("gz.msgs.{}", replace_name);
 
-    let gen = quote! {
+    let generated = quote! {
         impl crate::GzMessage for #name {
             const TYPE_NAME: &'static str = #type_name;
         }
     };
-    gen.into()
+    generated.into()
 }

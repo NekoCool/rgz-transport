@@ -1,11 +1,11 @@
 [package]
 name = "rgz-msgs"
 version = "0.1.1"
-edition = "2021"
+edition = "2024"
 description = "A Rust implementation of gz-msgs"
 license = "MIT OR Apache-2.0"
 include = ["Cargo.toml", "src/**/*.rs", "build.rs", "gz-msgs/**/*.proto"]
-repository = "https://github.com/tygoto/rgz-transport"
+repository = "https://github.com/NekoCool/rgz-transport"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

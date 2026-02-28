@@ -1,10 +1,10 @@
 [package]
 name = "rgz-derive"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "A derive macro for rgz"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/tygoto/rgz-transport"
+repository = "https://github.com/NekoCool/rgz-transport"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
