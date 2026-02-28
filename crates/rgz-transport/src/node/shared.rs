@@ -825,6 +825,8 @@ mod tests {
     }
 
     // Check that a node can pub & sub to the same process.
+    #[cfg(feature = "network-tests")]
+    #[ignore = "requires network"]
     #[tokio::test]
     async fn test_pub_sub_same_process() {
         tracing_subscriber::fmt()
@@ -901,6 +903,8 @@ mod tests {
     }
 
     // Check that a node can pub & sub to another process.
+    #[cfg(feature = "network-tests")]
+    #[ignore = "requires network"]
     #[tokio::test]
     async fn test_pub_sub_another_process() {
         tracing_subscriber::fmt()
@@ -976,6 +980,8 @@ mod tests {
         drop(node_shared1);
         time::sleep(Duration::from_millis(1000)).await;
     }
+    #[cfg(feature = "network-tests")]
+    #[ignore = "requires network"]
     #[tokio::test]
     async fn test_req_res_same_process() {
         tracing_subscriber::fmt()
@@ -1058,6 +1064,8 @@ mod tests {
         assert_eq!(person.name, "Bob");
     }
 
+    #[cfg(feature = "network-tests")]
+    #[ignore = "requires network"]
     #[tokio::test]
     async fn test_req_res_another_process() {
         // tracing_subscriber::fmt()

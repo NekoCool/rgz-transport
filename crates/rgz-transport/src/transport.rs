@@ -581,6 +581,8 @@ mod tests {
         pub id: i32,
     }
 
+    #[cfg(feature = "network-tests")]
+    #[ignore = "requires network"]
     #[tokio::test]
     async fn test_pub_sub() {
         tracing_subscriber::fmt()
@@ -636,6 +638,8 @@ mod tests {
             assert_eq!(person.id, 1234);
         }
     }
+    #[cfg(feature = "network-tests")]
+    #[ignore = "requires network"]
     #[tokio::test]
     async fn test_req_res() {
         // tracing_subscriber::fmt()

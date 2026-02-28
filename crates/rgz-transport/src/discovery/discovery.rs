@@ -1002,6 +1002,8 @@ mod tests {
     }
 
     // Advertise a topic
+    #[cfg(feature = "network-tests")]
+    #[ignore = "requires network"]
     #[tokio::test]
     async fn test_advertise() {
         // tracing_subscriber::fmt()
@@ -1039,6 +1041,8 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "network-tests")]
+    #[ignore = "requires network"]
     #[tokio::test]
     async fn test_start_does_not_panic_on_interface_registration_failure() {
         let mut discovery = Discovery::new(&P_UUID1, IP, MSG_PORT, true);
@@ -1048,6 +1052,8 @@ mod tests {
     }
 
     // Check that the discovery triggers the callbacks after an advertise.
+    #[cfg(feature = "network-tests")]
+    #[ignore = "requires network"]
     #[tokio::test]
     async fn test_advertise_with_callback() {
         let mut discovery1 = Discovery::new(&P_UUID1, IP, MSG_PORT, true);
@@ -1104,6 +1110,8 @@ mod tests {
         }
     }
     //
+    #[cfg(feature = "network-tests")]
+    #[ignore = "requires network"]
     #[tokio::test]
     async fn test_advertise_same_process() {
         let mut discovery1 = Discovery::new(&P_UUID1, IP, MSG_PORT, true);
@@ -1139,6 +1147,8 @@ mod tests {
 
     // Check that the discovery triggers the callbacks after a discovery
     // and after register the discovery callback.
+    #[cfg(feature = "network-tests")]
+    #[ignore = "requires network"]
     #[tokio::test]
     async fn test_discovery() {
         let mut discovery1 = Discovery::new(&P_UUID1, IP, MSG_PORT, true);
@@ -1183,6 +1193,8 @@ mod tests {
 
     // Check that the discovery triggers the disconnection callback after
     // an unadvertise.
+    #[cfg(feature = "network-tests")]
+    #[ignore = "requires network"]
     #[tokio::test]
     async fn test_unadvertise() {
         tracing_subscriber::fmt()
@@ -1230,6 +1242,8 @@ mod tests {
 
     // Check that the discovery triggers the disconnection callback after
     // sending a BYE message (discovery object out of scope).
+    #[cfg(feature = "network-tests")]
+    #[ignore = "requires network"]
     #[tokio::test]
     async fn test_bye() {
         tracing_subscriber::fmt()
@@ -1278,6 +1292,8 @@ mod tests {
 
     // Check that the discovery detects two publishers advertising the same
     // topic name.
+    #[cfg(feature = "network-tests")]
+    #[ignore = "requires network"]
     #[tokio::test]
     async fn test_two_publishers_same_topic() {
         let mut discovery1 = Discovery::new(&P_UUID1, IP, MSG_PORT, true);
@@ -1334,6 +1350,8 @@ mod tests {
 
     // Check that a discovery service sends messages if there are
     // topics or services advertised in its process.
+    #[cfg(feature = "network-tests")]
+    #[ignore = "requires network"]
     #[tokio::test]
     async fn test_discovery_service() {
         // tracing_subscriber::fmt()

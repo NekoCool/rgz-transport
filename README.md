@@ -36,6 +36,20 @@ git submodule update --init --recursive
 cargo check --workspace
 ```
 
+## Testing
+
+Run the default unit suite:
+
+```bash
+cargo test -p rgz-transport --lib
+```
+
+Run network integration tests (ignored by default):
+
+```bash
+cargo test -p rgz-transport --lib --features network-tests -- --ignored --test-threads=1
+```
+
 ## Examples
 
 Transport examples live under `crates/rgz-transport/examples`.
