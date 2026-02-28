@@ -1,6 +1,6 @@
 use anyhow::Result;
-use rgz::msgs::StringMsg;
-use rgz::transport::Node;
+use rgz_msgs::StringMsg;
+use rgz_transport::Node;
 use std::time::Duration;
 
 #[tokio::main]

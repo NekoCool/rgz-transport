@@ -1,8 +1,8 @@
 use anyhow::Result;
 use tokio::signal;
 
-use rgz::msgs::StringMsg;
-use rgz::transport::Node;
+use rgz_msgs::StringMsg;
+use rgz_transport::Node;
 
 #[tokio::main]
 async fn main() -> Result<()> {

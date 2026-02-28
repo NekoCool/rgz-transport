@@ -3,8 +3,8 @@ use std::time::Duration;
 use anyhow::Result;
 use tokio::time::sleep;
 
-use rgz::msgs::StringMsg;
-use rgz::transport::Node;
+use rgz_msgs::StringMsg;
+use rgz_transport::Node;
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()

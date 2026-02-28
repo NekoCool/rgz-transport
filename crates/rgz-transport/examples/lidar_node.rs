@@ -4,8 +4,8 @@
 ///
 
 use anyhow::Result;
-use rgz::msgs::{LaserScan, Twist, Vector3d};
-use rgz::transport::Node;
+use rgz_msgs::{LaserScan, Twist, Vector3d};
+use rgz_transport::Node;
 use tokio::signal;
 
 #[tokio::main]
