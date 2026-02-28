@@ -1356,16 +1356,22 @@ mod tests {
         if let Ok(ip) = env::var("GZ_IP") {
             gz_ip = Some(ip.clone());
         }
-        env::set_var("GZ_IP", "127.0.0.1");
+        unsafe {
+            env::set_var("GZ_IP", "127.0.0.1");
+        }
 
         let mut discovery1 = Discovery::new(&P_UUID1, IP, MSG_PORT, true);
 
         assert_eq!(discovery1.host_addr.to_string(), "127.0.0.1");
 
         if let Some(ip) = gz_ip {
-            env::set_var("GZ_IP", ip);
+            unsafe {
+                env::set_var("GZ_IP", ip);
+            }
         } else {
-            env::set_var("GZ_IP", "");
+            unsafe {
+                env::set_var("GZ_IP", "");
+            }
         }
     }
 }
