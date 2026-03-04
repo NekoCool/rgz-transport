@@ -1,6 +1,5 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use std::collections::HashMap;
-use tracing::{debug, info};
 
 use crate::discovery::{DiscoveryPubType, DiscoveryPublisher};
 
@@ -20,39 +19,39 @@ impl DiscoveryStore {
         let processes = self
             .discovery_publishers
             .entry(discovery_publisher.topic.to_string())
-            .or_insert(HashMap::new());
+            .or_default();
 
-        if let Some(publishers) = processes.get(&discovery_publisher.process_uuid) {
-            if publishers.iter().any(|p| {
+        if let Some(publishers) = processes.get(&discovery_publisher.process_uuid)
+            && publishers.iter().any(|p| {
                 p.address == discovery_publisher.address
                     && p.node_uuid == discovery_publisher.node_uuid
-            }) {
-                bail!("Publisher already exists");
-            }
+            })
+        {
+            bail!("Publisher already exists");
         }
         processes
             .entry(discovery_publisher.process_uuid.to_string())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(discovery_publisher);
 
         Ok(())
     }
     /// Remove a publisher associated to a given topic and UUID pair.
     pub fn del_publisher_by_node(&mut self, topic: &str, p_uuid: &str, n_uuid: &str) -> Result<()> {
-        if let Some(processes) = self.discovery_publishers.get_mut(topic) {
-            if let Some(publishers) = processes.get_mut(p_uuid) {
-                if !publishers.iter().any(|p| p.node_uuid == n_uuid) {
-                    bail!("Publisher not found");
-                }
-                publishers.retain(|p| p.node_uuid != n_uuid);
-                if publishers.is_empty() {
-                    processes.remove(p_uuid);
-                }
-                if processes.is_empty() {
-                    self.discovery_publishers.remove(topic);
-                }
-                return Ok(());
+        if let Some(processes) = self.discovery_publishers.get_mut(topic)
+            && let Some(publishers) = processes.get_mut(p_uuid)
+        {
+            if !publishers.iter().any(|p| p.node_uuid == n_uuid) {
+                bail!("Publisher not found");
             }
+            publishers.retain(|p| p.node_uuid != n_uuid);
+            if publishers.is_empty() {
+                processes.remove(p_uuid);
+            }
+            if processes.is_empty() {
+                self.discovery_publishers.remove(topic);
+            }
+            return Ok(());
         }
         bail!("Publisher not found");
     }
@@ -217,9 +216,9 @@ impl DiscoveryStore {
     /// Print all the information for debugging purposes.
     pub fn print(&self) {
         let mut collect: Vec<_> = self.discovery_publishers.iter().collect();
-        collect.sort_by(|a, b| a.0.cmp(&b.0));
-        collect.iter().for_each(|(topic, processes)| {
-            processes.iter().for_each(|(p_uuid, publishers)| {
+        collect.sort_by(|a, b| a.0.cmp(b.0));
+        collect.iter().for_each(|(_topic, processes)| {
+            processes.iter().for_each(|(_p_uuid, publishers)| {
                 publishers.iter().for_each(|p| {
                     Self::print_publisher(p);
                 });
@@ -313,8 +312,8 @@ mod tests {
 
         store.add_publisher(pub1.clone()).unwrap();
 
-        assert_eq!(store.has_topic("topic1"), true);
-        assert_eq!(store.has_topic("topic2"), false);
+        assert!(store.has_topic("topic1"));
+        assert!(!store.has_topic("topic2"));
     }
 
     #[test]
@@ -331,7 +330,7 @@ mod tests {
 
         store.add_publisher(pub1.clone()).unwrap();
         let result = store.has_topic_and_msg_type("topic1", "gz.msgs.StringMsg");
-        assert_eq!(result, true);
+        assert!(result);
     }
 
     #[test]
@@ -347,8 +346,8 @@ mod tests {
         );
 
         store.add_publisher(pub1.clone()).unwrap();
-        assert_eq!(store.has_any_publishers("topic1", "p_uuid1"), true);
-        assert_eq!(store.has_any_publishers("topic1", "p_uuid2"), false);
+        assert!(store.has_any_publishers("topic1", "p_uuid1"));
+        assert!(!store.has_any_publishers("topic1", "p_uuid2"));
     }
 
     #[test]
@@ -363,8 +362,8 @@ mod tests {
             "gz.msgs.StringMsg",
         );
         store.add_publisher(pub1.clone()).unwrap();
-        assert_eq!(store.has_publisher("addr1"), true);
-        assert_eq!(store.has_publisher("addr2"), false);
+        assert!(store.has_publisher("addr1"));
+        assert!(!store.has_publisher("addr2"));
     }
 
     #[test]
@@ -463,19 +462,19 @@ mod tests {
         // assert_eq!(pubs.len(), 2);
 
         let result = store.del_publisher_by_node("topic1", "p_uuid1", "n_uuid1");
-        assert_eq!(result.is_ok(), true);
+        assert!(result.is_ok());
 
         let result = store.del_publisher_by_node("topic1", "p_uuid1", "n_uuid1");
-        assert_eq!(result.is_err(), true);
+        assert!(result.is_err());
 
         let pubs = store.publishers(None, None, None);
         assert_eq!(pubs.len(), 2);
-        assert!(pubs
-            .iter()
-            .any(|p| p.topic == "topic1" && p.process_uuid == "p_uuid1" && p.node_uuid == "n_uuid2"));
-        assert!(pubs
-            .iter()
-            .any(|p| p.topic == "topic2" && p.process_uuid == "p_uuid1" && p.node_uuid == "n_uuid1"));
+        assert!(pubs.iter().any(|p| p.topic == "topic1"
+            && p.process_uuid == "p_uuid1"
+            && p.node_uuid == "n_uuid2"));
+        assert!(pubs.iter().any(|p| p.topic == "topic2"
+            && p.process_uuid == "p_uuid1"
+            && p.node_uuid == "n_uuid1"));
     }
 
     #[test]
@@ -516,10 +515,10 @@ mod tests {
         assert_eq!(pubs.len(), 2);
 
         let result = store.del_publishers_by_process("p_uuid1");
-        assert_eq!(result.is_ok(), true);
+        assert!(result.is_ok());
 
         let result = store.del_publishers_by_process("p_uuid1");
-        assert_eq!(result.is_err(), true);
+        assert!(result.is_err());
 
         let pubs = store.publishers(Some("topic1"), None, None);
         assert_eq!(pubs.len(), 0);
@@ -626,7 +625,7 @@ mod tests {
 
     #[test]
     fn test_print() {
-        let store = DiscoveryStore::new();
+        let _store = DiscoveryStore::new();
 
         let pub1 = create_msg_publisher(
             "topic1",

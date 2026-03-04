@@ -1,7 +1,6 @@
 use proc_macro::TokenStream;
 use quote::quote;
 use regex::Regex;
-use syn;
 
 #[proc_macro_derive(GzMessage)]
 pub fn gz_message_macro_derive(input: TokenStream) -> TokenStream {

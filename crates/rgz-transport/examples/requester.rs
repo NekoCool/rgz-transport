@@ -15,7 +15,8 @@ async fn main() -> Result<()> {
     let request = Some(str_msg);
     let timeout = Some(Duration::from_millis(3000));
     let res = node
-        .request::<StringMsg, StringMsg>(topic, request, timeout).await?;
+        .request::<StringMsg, StringMsg>(topic, request, timeout)
+        .await?;
     println!("RES: {:?}", res);
     Ok(())
 }

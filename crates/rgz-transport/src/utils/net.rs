@@ -42,16 +42,16 @@ fn hostname_to_ip(hostname: &str) -> Result<Ipv4Addr, String> {
             return Ok(ipv4);
         }
     }
-    return Err(format!("No IPv4 address found for {}", hostname));
+    Err(format!("No IPv4 address found for {}", hostname))
 }
 
 pub fn determine_host() -> Result<Ipv4Addr, Box<dyn std::error::Error>> {
     // First, did the user set GZ_IP?
-    if let Ok(gz_ip) = env::var("GZ_IP") {
-        if !gz_ip.is_empty() {
-            let ip = Ipv4Addr::from_str(&gz_ip)?;
-            return Ok(ip);
-        }
+    if let Ok(gz_ip) = env::var("GZ_IP")
+        && !gz_ip.is_empty()
+    {
+        let ip = Ipv4Addr::from_str(&gz_ip)?;
+        return Ok(ip);
     }
     // Second, try the preferred local and public IP address.
     if let Ok(public_ip) = preferred_public_ip() {
@@ -68,7 +68,7 @@ pub fn determine_host() -> Result<Ipv4Addr, Box<dyn std::error::Error>> {
 
     interfaces
         .first()
-        .map(|iface| *iface)
+        .copied()
         .ok_or_else(|| "No interfaces found".into())
 }
 
@@ -88,7 +88,7 @@ pub fn determine_interfaces() -> Result<Vec<Ipv4Addr>, Box<dyn std::error::Error
 }
 
 pub fn hostname() -> String {
-    whoami::hostname()
+    whoami::fallible::hostname().unwrap_or_else(|_| "unknown-host".to_string())
 }
 pub fn username() -> String {
     whoami::username()

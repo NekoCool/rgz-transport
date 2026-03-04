@@ -1,12 +1,14 @@
+#![allow(clippy::module_inception)]
+
 mod discovery;
-mod types;
 mod store;
+mod types;
 
 pub(crate) use discovery::Discovery;
-pub(crate) use types::*;
 pub(crate) use store::DiscoveryStore;
+pub(crate) use types::*;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use std::env;
 
 /// Longest string to receive.
@@ -37,7 +39,7 @@ fn version() -> u32 {
     WIRE_VERSION + (gz_stats as u32 * 100)
 }
 
-fn discovery_msg_decode(rcv_str: &mut Vec<u8>, received: usize) -> Result<DiscoveryMsg> {
+fn discovery_msg_decode(rcv_str: &mut [u8], received: usize) -> Result<DiscoveryMsg> {
     use prost::Message;
 
     let mut buf = [0u8; 2];
@@ -67,8 +69,7 @@ fn discovery_msg_encode(msg: &DiscoveryMsg) -> Result<(Vec<u8>, usize)> {
     let mut buffer = vec![0u8; total_size];
     buffer[0..2].copy_from_slice(&msg_size.to_le_bytes());
 
-    let mut buf = Vec::new();
-    buf.reserve(msg_size_full);
+    let mut buf = Vec::with_capacity(msg_size_full);
     if msg.encode(&mut buf).is_ok() {
         buffer[2..total_size].copy_from_slice(&buf);
         return Ok((buffer, total_size));

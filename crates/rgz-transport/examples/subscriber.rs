@@ -1,5 +1,5 @@
-use std::env;
 use anyhow::Result;
+use std::env;
 use tokio::signal;
 
 use rgz_msgs::StringMsg;

@@ -2,7 +2,6 @@
 /// This is a Rust rewrite of lidar_node.c from the following tutorial.
 /// https://gazebosim.org/docs/harmonic/sensors
 ///
-
 use anyhow::Result;
 use rgz_msgs::{LaserScan, Twist, Vector3d};
 use rgz_transport::Node;
