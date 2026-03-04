@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 mod discovery;
 mod dispatcher;
 mod node;

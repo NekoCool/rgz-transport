@@ -1,18 +1,18 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::{Arc, Mutex};
 use std::{env, io};
 use tokio::net::UdpSocket;
 use tokio::select;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::time::{self, Duration, Instant};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::discovery::store::DiscoveryStore;
 use crate::discovery::{
-    discovery_msg_decode, discovery_msg_encode, version, DEF_ACTIVITY_INTERVAL,
-    DEF_HEARTBEAT_INTERVAL, DEF_SILENCE_INTERVAL, MAX_RCV_STR, TIMEOUT,
+    DEF_ACTIVITY_INTERVAL, DEF_HEARTBEAT_INTERVAL, DEF_SILENCE_INTERVAL, MAX_RCV_STR, TIMEOUT,
+    discovery_msg_decode, discovery_msg_encode, version,
 };
 use crate::discovery::{
     DiscoveryDiscContents, DiscoveryFlags, DiscoveryMsg, DiscoveryPublisher, DiscoveryScope,
@@ -89,7 +89,7 @@ impl Discovery {
         let p_uuid = p_uuid.to_string();
         let ip = ip.to_string();
         let multicast_group = ip.parse::<Ipv4Addr>().unwrap();
-        let multicast_addr = SocketAddrV4::new(multicast_group.into(), port);
+        let multicast_addr = SocketAddrV4::new(multicast_group, port);
         let mut host_addr = Ipv4Addr::new(127, 0, 0, 1);
         if let Ok(host) = net_utils::determine_host() {
             host_addr = host;
@@ -198,19 +198,17 @@ impl Discovery {
     }
 
     pub fn unadvertise(&self, topic: &str, n_uuid: &str) -> Result<()> {
-        let mut publisher = None;
-
-        {
+        let publisher = {
             let mut store = self.discovery_store.lock().unwrap();
             if let Some(p) = store.publisher(topic, &self.p_uuid, n_uuid) {
-                publisher = Some(p.clone());
+                let publisher = p.clone();
+                store.del_publisher_by_node(topic, &self.p_uuid, n_uuid)?;
+                publisher
             } else {
                 warn!("Failed to find publisher");
                 return Ok(());
             }
-            store.del_publisher_by_node(topic, &self.p_uuid, n_uuid)?;
-        }
-        let publisher = publisher.unwrap();
+        };
 
         if publisher.scope == DiscoveryScope::Process as i32 {
             // Only unadvertise a message outside this process if the scope is not 'Process'.
@@ -357,8 +355,7 @@ impl Discovery {
             return;
         };
 
-        let mut heartbeat_interval =
-            time::interval(Duration::from_millis(self.heartbeat_interval));
+        let mut heartbeat_interval = time::interval(Duration::from_millis(self.heartbeat_interval));
         let mut activity_interval = time::interval(Duration::from_millis(self.activity_interval));
 
         let inner = DiscoveryInner::new(
@@ -366,7 +363,7 @@ impl Discovery {
             self.p_uuid.clone(),
             socket.clone(),
             self.host_interfaces.clone(),
-            self.multicast_addr.clone(),
+            self.multicast_addr,
             self.relay_addrs.clone(),
             self.activity.clone(),
             self.discovery_store.clone(),
@@ -469,17 +466,17 @@ impl Discovery {
 
 impl Drop for Discovery {
     fn drop(&mut self) {
-        if let Some(sender) = self.msg_sender.as_ref() {
-            if let Err(err) = sender.send(SendMsg {
+        if let Some(sender) = self.msg_sender.as_ref()
+            && let Err(err) = sender.send(SendMsg {
                 destination_type: DestinationType::All,
                 discovery_type: DiscoveryType::Bye,
                 discovery_publisher: DiscoveryPublisher {
                     process_uuid: self.p_uuid.clone(),
                     ..Default::default()
                 },
-            }) {
-                debug!("Failed to send bye message: {}", err);
-            }
+            })
+        {
+            debug!("Failed to send bye message: {}", err);
         }
     }
 }
@@ -504,6 +501,7 @@ pub(super) struct DiscoveryInner {
 }
 
 impl DiscoveryInner {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         version: u32,
         p_uuid: String,
@@ -537,8 +535,7 @@ impl DiscoveryInner {
         }
     }
     fn is_local_ip(&self, from_ip: Ipv4Addr) -> bool {
-        self.host_interfaces.iter().any(|&iface| iface == from_ip)
-            || from_ip.to_string().starts_with("127.")
+        self.host_interfaces.contains(&from_ip) || from_ip.to_string().starts_with("127.")
     }
 
     async fn recv_messages(
@@ -711,12 +708,11 @@ impl DiscoveryInner {
         match msg_type {
             DiscoveryType::Advertise => {
                 // Check scope of the topic.
-                if let Ok(scope) = DiscoveryScope::try_from(publisher.scope) {
-                    if scope == DiscoveryScope::Process
-                        || (scope == DiscoveryScope::Host && !is_sender_local)
-                    {
-                        return Ok(()); // Discard the message.
-                    }
+                if let Ok(scope) = DiscoveryScope::try_from(publisher.scope)
+                    && (scope == DiscoveryScope::Process
+                        || (scope == DiscoveryScope::Host && !is_sender_local))
+                {
+                    return Ok(()); // Discard the message.
                 }
 
                 // Register an advertised address for the topic.
@@ -746,7 +742,7 @@ impl DiscoveryInner {
                         let mut v = vec![];
                         let store = self.discovery_store.lock().unwrap();
                         for p in store.publishers(Some(recv_topic), Some(&msg.process_uuid), None) {
-                                if let Ok(scope) = DiscoveryScope::try_from(p.scope) {
+                            if let Ok(scope) = DiscoveryScope::try_from(p.scope) {
                                 if scope == DiscoveryScope::Process
                                     || (scope == DiscoveryScope::Host && !is_sender_local)
                                 {
@@ -800,12 +796,11 @@ impl DiscoveryInner {
                 }
             }
             DiscoveryType::Unadvertise => {
-                if let Ok(scope) = DiscoveryScope::try_from(publisher.scope) {
-                    if scope == DiscoveryScope::Process
-                        || (scope == DiscoveryScope::Host && !is_sender_local)
-                    {
-                        return Ok(()); // Discard the message.
-                    }
+                if let Ok(scope) = DiscoveryScope::try_from(publisher.scope)
+                    && (scope == DiscoveryScope::Process
+                        || (scope == DiscoveryScope::Host && !is_sender_local))
+                {
+                    return Ok(()); // Discard the message.
                 }
 
                 if let Some(cb) = self.disconnection_cb.lock().unwrap().as_ref() {
@@ -901,11 +896,11 @@ impl DiscoveryInner {
                 .lock()
                 .unwrap()
                 .iter()
-                .map(|x| x.clone())
+                .copied()
                 .collect::<Vec<_>>()
         };
 
-        if let Ok((buffer, total_size)) = discovery_msg_encode(&msg) {
+        if let Ok((buffer, total_size)) = discovery_msg_encode(msg) {
             for sock_addr in addrs {
                 match self.socket.send_to(&buffer, sock_addr).await {
                     Ok(sent) if sent != total_size => {
@@ -928,7 +923,7 @@ impl DiscoveryInner {
         Ok(())
     }
     async fn send_multicast(&self, msg: &DiscoveryMsg) -> Result<()> {
-        if let Ok((buffer, total_size)) = discovery_msg_encode(&msg) {
+        if let Ok((buffer, total_size)) = discovery_msg_encode(msg) {
             // TODO: Support multiple Sockets.
             // for sock in self.sockets.iter() { }
             match self.socket.send_to(&buffer, self.multicast_addr).await {
@@ -956,7 +951,7 @@ impl DiscoveryInner {
 #[cfg(test)]
 mod tests {
     use once_cell::sync::Lazy;
-    use tracing_subscriber;
+
     use uuid::uuid;
 
     use super::*;
@@ -968,21 +963,21 @@ mod tests {
     const SERVICE_NAME: &str = "test_service";
     const ADDR1: &str = "tcp://127.0.0.1:12345";
     const CTRL1: &str = "tcp://127.0.0.1:12346";
-    const P_UUID1: Lazy<String> =
+    static P_UUID1: Lazy<String> =
         Lazy::new(|| uuid!("00000000-0000-0000-0000-000000000011").to_string());
-    const N_UUID1: Lazy<String> =
+    static N_UUID1: Lazy<String> =
         Lazy::new(|| uuid!("00000000-0000-0000-0000-000000000012").to_string());
     const ADDR2: &str = "tcp://127.0.0.1:12347";
     const CTRL2: &str = "tcp://127.0.0.1:12348";
-    const P_UUID2: Lazy<String> =
+    static P_UUID2: Lazy<String> =
         Lazy::new(|| uuid!("00000000-0000-0000-0000-000000000021").to_string());
-    const N_UUID2: Lazy<String> =
+    static N_UUID2: Lazy<String> =
         Lazy::new(|| uuid!("00000000-0000-0000-0000-000000000022").to_string());
 
     // Try to use the discovery features without calling start().
     #[tokio::test]
     async fn test_without_calling_start() {
-        let mut discovery = Discovery::new(&P_UUID1, IP, MSG_PORT, true);
+        let discovery = Discovery::new(&P_UUID1, IP, MSG_PORT, true);
 
         let result = discovery.advertise(DiscoveryPublisher {
             topic: TOPIC.to_string(),
@@ -1380,16 +1375,20 @@ mod tests {
 
         {
             let activity = discovery1.activity.lock().unwrap();
-            assert!(activity
-                .iter()
-                .any(|(process_uuid, _)| process_uuid == &P_UUID2.to_string()));
+            assert!(
+                activity
+                    .iter()
+                    .any(|(process_uuid, _)| process_uuid == &P_UUID2.to_string())
+            );
         }
 
         {
             let activity = discovery2.activity.lock().unwrap();
-            assert!(activity
-                .iter()
-                .any(|(process_uuid, _)| process_uuid == &P_UUID1.to_string()));
+            assert!(
+                activity
+                    .iter()
+                    .any(|(process_uuid, _)| process_uuid == &P_UUID1.to_string())
+            );
         }
 
         drop(discovery2);
@@ -1418,7 +1417,7 @@ mod tests {
             env::set_var("GZ_IP", "127.0.0.1");
         }
 
-        let mut discovery1 = Discovery::new(&P_UUID1, IP, MSG_PORT, true);
+        let discovery1 = Discovery::new(&P_UUID1, IP, MSG_PORT, true);
 
         assert_eq!(discovery1.host_addr.to_string(), "127.0.0.1");
 

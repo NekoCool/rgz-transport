@@ -3,9 +3,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::{env, process};
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use once_cell::sync::Lazy;
-use prost::bytes::Buf;
 use tokio::select;
 
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -13,17 +12,14 @@ use tokio::sync::oneshot;
 
 use tracing::{debug, error, info, trace};
 
-use crate::discovery::{
-    Discovery, DiscoveryPubType, DiscoveryPublisher,
-    DiscoveryStore,
-};
+use crate::discovery::{Discovery, DiscoveryPubType, DiscoveryPublisher, DiscoveryStore};
 use crate::dispatcher::{
     CleanFunction, DeleteFunction, Dispatcher, DispatcherStore, PendingRequest, ResponseDispatcher,
     ServiceDispatcher, Subscriber,
 };
 use crate::node::{
-    NodeEvent, SubscribeArgs, TransportEvent, DEFAULT_DISCOVERY_IP, DEFAULT_MSG_DISC_PORT,
-    DEFAULT_SRV_DISC_PORT,
+    DEFAULT_DISCOVERY_IP, DEFAULT_MSG_DISC_PORT, DEFAULT_SRV_DISC_PORT, NodeEvent, SubscribeArgs,
+    TransportEvent,
 };
 use crate::transport::{PublishMessage, ReplyMessage, RequestMessage, Transporter};
 use crate::utils::env as env_utils;
@@ -54,7 +50,7 @@ impl NodeShared {
     pub fn instance() -> Arc<Mutex<NodeShared>> {
         let pid = process::id();
         let mut node_shared_map = NODE_SHARED_MAP.lock().unwrap();
-        return if let Some(node_shared) = node_shared_map.get(&pid) {
+        if let Some(node_shared) = node_shared_map.get(&pid) {
             node_shared.clone()
         } else {
             // No instance found, create a new one and insert it into the map.
@@ -64,23 +60,23 @@ impl NodeShared {
             let new_node_shared = Arc::new(Mutex::new(new_node_shared));
             node_shared_map.insert(pid, new_node_shared.clone());
             new_node_shared
-        };
+        }
     }
     fn new() -> Self {
         let mut verbose = false;
         let p_uuid = uuid::Uuid::new_v4().to_string();
         let mut discovery_ip = DEFAULT_DISCOVERY_IP.to_string();
         // If GZ_VERBOSE=1 enable the verbose mode.
-        if let Ok(gz_verbose) = env::var("GZ_VERBOSE") {
-            if !gz_verbose.is_empty() {
-                verbose = gz_verbose == "1";
-            }
+        if let Ok(gz_verbose) = env::var("GZ_VERBOSE")
+            && !gz_verbose.is_empty()
+        {
+            verbose = gz_verbose == "1";
         }
         // Set the multicast IP used for discovery.
-        if let Ok(ip) = env::var("GZ_DISCOVERY_MULTICAST_IP") {
-            if !ip.is_empty() {
-                discovery_ip = ip;
-            }
+        if let Ok(ip) = env::var("GZ_DISCOVERY_MULTICAST_IP")
+            && !ip.is_empty()
+        {
+            discovery_ip = ip;
         }
         // Set the port used for msg discovery.
         let msg_disc_port =
@@ -432,7 +428,7 @@ impl NodeSharedInner {
             println!("\tProcess UUID: {}", process_uuid);
         }
         // A remote subscriber[s] has been disconnected.
-        if topic != "" && node_uuid != "" {
+        if !topic.is_empty() && !node_uuid.is_empty() {
             let _ = self.subscribers.remove_by_node(topic, node_uuid);
         } else {
             self.subscribers.del_by_process(process_uuid);
@@ -594,7 +590,7 @@ impl NodeSharedInner {
             .subscribers
             .filter(&msg.topic, Some(&msg.msg_type), None)
         {
-            for mut dispatcher in dispatchers {
+            for dispatcher in dispatchers {
                 let publish_message = msg.clone();
                 if dispatcher.is_remote() {
                     // Send the message to the remote subscriber.
@@ -639,7 +635,7 @@ impl NodeSharedInner {
             error!("Failed to register dispatcher: {}", err);
         }
 
-        if let Some(discovery_publishers) = self.srv_discovery.publishers(&topic) {
+        if let Some(discovery_publishers) = self.srv_discovery.publishers(topic) {
             for discovery_publisher in discovery_publishers {
                 let service_publisher = match discovery_publisher.pub_type {
                     Some(DiscoveryPubType::SrvPub(ref srv_pub)) => srv_pub,
@@ -651,7 +647,7 @@ impl NodeSharedInner {
                     let replier_address = discovery_publisher.address.as_str();
                     let replier_id = service_publisher.socket_id.as_str();
                     self.send_pending_remote_reqs(
-                        &topic,
+                        topic,
                         request_type,
                         response_type,
                         replier_address,
@@ -662,7 +658,7 @@ impl NodeSharedInner {
             }
         } else {
             // Discover the service.
-            if let Err(err) = self.srv_discovery.discover(&topic) {
+            if let Err(err) = self.srv_discovery.discover(topic) {
                 debug!("Failed to discover: {}", err);
             }
         }
@@ -698,9 +694,9 @@ impl NodeSharedInner {
     // Transport Event Handler
     fn on_subscription(&mut self, msg: PublishMessage) {
         trace!("on_subscription {:?}", msg);
-        if let Some(mut subscribers) =
-            self.subscribers
-                .filter(&msg.topic, Some(&msg.msg_type), None)
+        if let Some(subscribers) = self
+            .subscribers
+            .filter(&msg.topic, Some(&msg.msg_type), None)
         {
             for subscriber in subscribers {
                 if !subscriber.is_remote() {
@@ -790,16 +786,11 @@ impl NodeSharedInner {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "network-tests")]
     use prost::Message;
-    use std::time::{Duration, SystemTime};
-    use tokio::time;
+
     // use tracing::subscriber;
     // use tracing_subscriber::FmtSubscriber;
-    use crate::discovery::{
-        DiscoveryMsgPublisher, DiscoveryPubType, DiscoveryScope, DiscoverySrvPublisher,
-    };
-
-    use super::*;
 
     const MSG_PORT: u16 = 11319;
     const SRV_PORT: u16 = 11320;

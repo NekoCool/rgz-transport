@@ -9,12 +9,12 @@ fn get_proto_file_paths(dir_path: &str) -> Result<Vec<PathBuf>, Box<dyn Error>> 
     for entry in entries {
         let entry = entry?;
         let file_path = entry.path();
-        if let Some(file_ext) = file_path.extension() {
-            if file_ext == ext {
-                let mut p = PathBuf::from(dir_path);
-                p.push(entry.file_name());
-                file_paths.push(p);
-            }
+        if let Some(file_ext) = file_path.extension()
+            && file_ext == ext
+        {
+            let mut p = PathBuf::from(dir_path);
+            p.push(entry.file_name());
+            file_paths.push(p);
         }
     }
     Ok(file_paths)

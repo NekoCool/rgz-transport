@@ -3,11 +3,10 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::thread::sleep;
-use std::time::{Duration};
+use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use tracing::{debug, error};
-use zmq;
 
 /// Timeout used for receiving messages (ms.).
 const TIMEOUT: i64 = 250;
@@ -297,32 +296,32 @@ impl Transporter {
 
             loop {
                 if let Ok(event) = subscribe_evt_receiver.try_recv() {
-                    if let Some(address) = event.connect {
-                        if let Err(e) = inner.connect(&address) {
-                            error!("failed connecting subscriber to [{}]: {}", address, e);
-                        }
+                    if let Some(address) = event.connect
+                        && let Err(e) = inner.connect(&address)
+                    {
+                        error!("failed connecting subscriber to [{}]: {}", address, e);
                     }
-                    if let Some(address) = event.disconnect {
-                        if let Err(e) = inner.disconnect(&address) {
-                            error!("failed disconnecting subscriber from [{}]: {}", address, e);
-                        }
+                    if let Some(address) = event.disconnect
+                        && let Err(e) = inner.disconnect(&address)
+                    {
+                        error!("failed disconnecting subscriber from [{}]: {}", address, e);
                     }
-                    if let Some(topic) = event.subscribe {
-                        if let Err(e) = inner.set_subscribe(&topic) {
-                            error!("failed subscribing to [{}]: {}", topic, e);
-                        }
+                    if let Some(topic) = event.subscribe
+                        && let Err(e) = inner.set_subscribe(&topic)
+                    {
+                        error!("failed subscribing to [{}]: {}", topic, e);
                     }
-                    if let Some(topic) = event.unsubscribe {
-                        if let Err(e) = inner.set_unsubscribe(&topic) {
-                            error!("failed unsubscribing to [{}]: {}", topic, e);
-                        }
+                    if let Some(topic) = event.unsubscribe
+                        && let Err(e) = inner.set_unsubscribe(&topic)
+                    {
+                        error!("failed unsubscribing to [{}]: {}", topic, e);
                     }
                 }
 
-                if let Ok(msg) = reply_msg_receiver.try_recv() {
-                    if let Err(e) = inner.reply(msg) {
-                        error!("failed replying: {}", e);
-                    }
+                if let Ok(msg) = reply_msg_receiver.try_recv()
+                    && let Err(e) = inner.reply(msg)
+                {
+                    error!("failed replying: {}", e);
                 }
 
                 inner.poll(TIMEOUT).expect("poll failed");
@@ -350,6 +349,7 @@ struct TransporterInner {
 }
 
 impl TransporterInner {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         context: zmq::Context,
         host_addr: &str,
@@ -425,7 +425,7 @@ impl TransporterInner {
     }
     fn disconnect(&self, address: &str) -> Result<()> {
         self.connections.lock().unwrap().remove(address);
-        self.subscriber.disconnect(&address)?;
+        self.subscriber.disconnect(address)?;
         Ok(())
     }
 
@@ -565,10 +565,8 @@ impl TransporterInner {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    #[cfg(feature = "network-tests")]
     use prost::Message;
-    use std::io::Cursor;
-    use std::time::SystemTime;
 
     const IP: &str = "127.0.0.1";
     const TOPIC: &str = "topic";
