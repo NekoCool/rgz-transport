@@ -64,7 +64,9 @@ fn discovery_msg_encode(msg: &DiscoveryMsg) -> Result<(Vec<u8>, usize)> {
         bail!("Discovery message too large to send. Discovery won't work. This shouldn't happen.");
     }
 
-    let msg_size: u16 = msg_size_full.try_into().unwrap();
+    let msg_size: u16 = msg_size_full
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Discovery message length overflow: {}", msg_size_full))?;
     let total_size = std::mem::size_of::<u16>() + msg_size as usize;
     let mut buffer = vec![0u8; total_size];
     buffer[0..2].copy_from_slice(&msg_size.to_le_bytes());

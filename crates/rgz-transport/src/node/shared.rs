@@ -49,7 +49,13 @@ pub(crate) struct NodeShared {
 impl NodeShared {
     pub fn instance() -> Arc<Mutex<NodeShared>> {
         let pid = process::id();
-        let mut node_shared_map = NODE_SHARED_MAP.lock().unwrap();
+        let mut node_shared_map = match NODE_SHARED_MAP.lock() {
+            Ok(map) => map,
+            Err(err) => {
+                error!("NODE_SHARED_MAP lock poisoned: {}", err);
+                err.into_inner()
+            }
+        };
         if let Some(node_shared) = node_shared_map.get(&pid) {
             node_shared.clone()
         } else {
@@ -110,13 +116,19 @@ impl NodeShared {
         }
     }
     fn start(&mut self) {
-        let mut inner = NodeSharedInner::new(
+        let mut inner = match NodeSharedInner::new(
             &self.p_uuid,
             &self.discovery_ip,
             self.msg_disc_port,
             self.srv_disc_port,
             self.verbose,
-        );
+        ) {
+            Ok(inner) => inner,
+            Err(err) => {
+                error!("Failed to initialize NodeSharedInner: {}", err);
+                return;
+            }
+        };
         let node_event_sender = inner.node_event_sender();
         self.node_event_sender = Some(node_event_sender);
 
@@ -180,7 +192,13 @@ impl NodeShared {
 impl Drop for NodeShared {
     fn drop(&mut self) {
         let pid = process::id();
-        let mut node_shared_map = NODE_SHARED_MAP.lock().unwrap();
+        let mut node_shared_map = match NODE_SHARED_MAP.lock() {
+            Ok(map) => map,
+            Err(err) => {
+                error!("NODE_SHARED_MAP lock poisoned on drop: {}", err);
+                err.into_inner()
+            }
+        };
         node_shared_map.remove(&pid);
         if let Some(handle) = self.handle.take() {
             handle.abort();
@@ -217,7 +235,7 @@ impl NodeSharedInner {
         msg_disc_port: u16,
         srv_disc_port: u16,
         verbose: bool,
-    ) -> Self {
+    ) -> Result<Self> {
         let (discovery_event_sender, discovery_event_receiver) =
             mpsc::unbounded_channel::<DiscoveryEvent>();
         let (node_event_sender, node_event_receiver) = mpsc::unbounded_channel::<NodeEvent>();
@@ -229,61 +247,67 @@ impl NodeSharedInner {
 
         let sender = discovery_event_sender.clone();
         msg_discovery.set_connection_cb(move |discovery_publisher| {
-            sender
-                .send(DiscoveryEvent::Connection(discovery_publisher))
-                .unwrap();
+            if let Err(err) = sender.send(DiscoveryEvent::Connection(discovery_publisher)) {
+                error!("Failed to send connection event: {}", err);
+            }
         });
         let sender = discovery_event_sender.clone();
         msg_discovery.set_disconnection_cb(move |discovery_publisher| {
-            sender
-                .send(DiscoveryEvent::Disconnection(discovery_publisher))
-                .unwrap();
+            if let Err(err) = sender.send(DiscoveryEvent::Disconnection(discovery_publisher)) {
+                error!("Failed to send disconnection event: {}", err);
+            }
         });
         let sender = discovery_event_sender.clone();
         msg_discovery.set_registration_cb(move |discovery_publisher| {
-            sender
-                .send(DiscoveryEvent::Registration(discovery_publisher))
-                .unwrap();
+            if let Err(err) = sender.send(DiscoveryEvent::Registration(discovery_publisher)) {
+                error!("Failed to send registration event: {}", err);
+            }
         });
         let sender = discovery_event_sender.clone();
         msg_discovery.set_unregistration_cb(move |discovery_publisher| {
-            sender
-                .send(DiscoveryEvent::Unregistration(discovery_publisher))
-                .unwrap();
+            if let Err(err) = sender.send(DiscoveryEvent::Unregistration(discovery_publisher)) {
+                error!("Failed to send unregistration event: {}", err);
+            }
         });
 
         // srv discovery
         let mut srv_discovery = Discovery::new(p_uuid, discovery_ip, srv_disc_port, verbose);
         let sender = discovery_event_sender.clone();
         srv_discovery.set_connection_cb(move |discovery_publisher| {
-            sender
-                .send(DiscoveryEvent::SrvConnection(discovery_publisher))
-                .unwrap();
+            if let Err(err) = sender.send(DiscoveryEvent::SrvConnection(discovery_publisher)) {
+                error!("Failed to send service connection event: {}", err);
+            }
         });
         let sender = discovery_event_sender.clone();
         srv_discovery.set_disconnection_cb(move |discovery_publisher| {
-            sender
-                .send(DiscoveryEvent::SrvDisconnection(discovery_publisher))
-                .unwrap();
+            if let Err(err) = sender.send(DiscoveryEvent::SrvDisconnection(discovery_publisher)) {
+                error!("Failed to send service disconnection event: {}", err);
+            }
         });
 
         // transporter
         let host_addr = msg_discovery.host_addr().to_string();
-        let mut transporter = Transporter::new(&host_addr);
+        let mut transporter = Transporter::new(&host_addr)?;
         let sender = transport_event_sender.clone();
         transporter.set_subscription_handler(move |msg| {
-            sender.send(TransportEvent::Subscription(msg)).unwrap();
+            if let Err(err) = sender.send(TransportEvent::Subscription(msg)) {
+                error!("Failed to forward subscription event: {}", err);
+            }
         });
         let sender = transport_event_sender.clone();
         transporter.set_request_handler(move |msg| {
-            sender.send(TransportEvent::Request(msg)).unwrap();
+            if let Err(err) = sender.send(TransportEvent::Request(msg)) {
+                error!("Failed to forward request event: {}", err);
+            }
         });
         let sender = transport_event_sender.clone();
         transporter.set_response_handler(move |msg| {
-            sender.send(TransportEvent::Response(msg)).unwrap();
+            if let Err(err) = sender.send(TransportEvent::Response(msg)) {
+                error!("Failed to forward response event: {}", err);
+            }
         });
 
-        NodeSharedInner {
+        Ok(NodeSharedInner {
             p_uuid: p_uuid.to_string(),
             discovery_event_receiver,
             discovery_event_sender,
@@ -298,7 +322,7 @@ impl NodeSharedInner {
             response_dispatchers: DispatcherStore::new(),
             services: DispatcherStore::new(),
             verbose,
-        }
+        })
     }
 
     fn node_event_sender(&self) -> UnboundedSender<NodeEvent> {
@@ -483,7 +507,12 @@ impl NodeSharedInner {
         }
 
         // Delete a remote subscriber.
-        self.subscribers.remove_by_node(topic, node_uuid).unwrap();
+        if self.subscribers.remove_by_node(topic, node_uuid).is_none() {
+            error!(
+                "Failed to remove subscriber [{}/{}]: no matching subscriber",
+                topic, node_uuid
+            );
+        }
     }
 
     fn on_srv_connection(&mut self, discovery_publisher: DiscoveryPublisher) {
@@ -566,7 +595,9 @@ impl NodeSharedInner {
             info!("Failed to register dispatcher: {}", err);
         }
         // Advertise the service.
-        self.srv_discovery.advertise(discovery_publisher).unwrap();
+        if let Err(err) = self.srv_discovery.advertise(discovery_publisher) {
+            error!("Failed to advertise service: {}", err);
+        }
     }
     fn on_subscribe(&mut self, args: SubscribeArgs) {
         trace!("on_subscribe");
@@ -599,9 +630,9 @@ impl NodeSharedInner {
                     }
                 } else {
                     // Send the message to the local subscriber.
-                    dispatcher
-                        .dispatch(publish_message)
-                        .expect("Failed to dispatch message");
+                    if let Err(err) = dispatcher.dispatch(publish_message) {
+                        error!("Failed to dispatch local publish message: {}", err);
+                    }
                 }
             }
         }
@@ -625,7 +656,9 @@ impl NodeSharedInner {
             if let Err(err) = self.response_dispatchers.register(dispatcher) {
                 error!("Failed to register dispatcher: {}", err);
             }
-            service.request(request_message).expect("Failed to request");
+            if let Err(err) = service.request(request_message) {
+                error!("Failed to request local service: {}", err);
+            }
             return;
         }
 
@@ -699,10 +732,10 @@ impl NodeSharedInner {
             .filter(&msg.topic, Some(&msg.msg_type), None)
         {
             for subscriber in subscribers {
-                if !subscriber.is_remote() {
-                    subscriber
-                        .dispatch(msg.clone())
-                        .expect("Failed to dispatch message");
+                if !subscriber.is_remote()
+                    && let Err(err) = subscriber.dispatch(msg.clone())
+                {
+                    error!("Failed to dispatch local subscription message: {}", err);
                 }
             }
         }
@@ -719,7 +752,9 @@ impl NodeSharedInner {
             if let Err(err) = self.response_dispatchers.register(dispatcher) {
                 error!("Failed to register dispatcher: {}", err);
             }
-            service.request(request_message).expect("Failed to request");
+            if let Err(err) = service.request(request_message) {
+                error!("Failed to request service: {}", err);
+            }
         } else {
             error!("Service not found");
         }
@@ -733,9 +768,9 @@ impl NodeSharedInner {
             self.response_dispatchers
                 .get(&msg.topic, &msg.node_uuid, &msg.req_uuid)
         {
-            dispatcher
-                .dispatch(msg)
-                .expect("Failed to dispatch message");
+            if let Err(err) = dispatcher.dispatch(msg) {
+                error!("Failed to dispatch response message: {}", err);
+            }
             dispatcher.done();
         } else {
             error!("ResponseDispatcher not found");

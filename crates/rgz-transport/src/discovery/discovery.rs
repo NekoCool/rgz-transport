@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use std::collections::{HashMap, HashSet};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::sync::{Arc, Mutex};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::{env, io};
 use tokio::net::UdpSocket;
 use tokio::select;
@@ -35,6 +35,12 @@ struct SendMsg {
 }
 
 type DiscoveryCallbackType = Box<dyn Fn(DiscoveryPublisher) + Send + Sync>;
+
+fn lock_mutex<'a, T>(mutex: &'a Mutex<T>, name: &str) -> Result<MutexGuard<'a, T>> {
+    mutex
+        .lock()
+        .map_err(|err| anyhow::anyhow!("Failed to lock {}: {}", name, err))
+}
 
 pub(crate) struct Discovery {
     // Discovery wire protocol version.
@@ -88,7 +94,13 @@ impl Discovery {
     pub(crate) fn new(p_uuid: &str, ip: &str, port: u16, verbose: bool) -> Self {
         let p_uuid = p_uuid.to_string();
         let ip = ip.to_string();
-        let multicast_group = ip.parse::<Ipv4Addr>().unwrap();
+        let multicast_group = ip.parse::<Ipv4Addr>().unwrap_or_else(|err| {
+            warn!(
+                "Invalid discovery multicast IP [{}]: {}. Falling back to 239.255.0.7",
+                ip, err
+            );
+            Ipv4Addr::new(239, 255, 0, 7)
+        });
         let multicast_addr = SocketAddrV4::new(multicast_group, port);
         let mut host_addr = Ipv4Addr::new(127, 0, 0, 1);
         if let Ok(host) = net_utils::determine_host() {
@@ -99,8 +111,12 @@ impl Discovery {
         let mut host_interfaces: Vec<Ipv4Addr> = Vec::new();
         if let Ok(gz_ip) = env::var("GZ_IP") {
             if !gz_ip.is_empty() {
-                let ip = gz_ip.parse::<Ipv4Addr>().unwrap();
-                host_interfaces.push(ip);
+                match gz_ip.parse::<Ipv4Addr>() {
+                    Ok(ip) => host_interfaces.push(ip),
+                    Err(err) => {
+                        warn!("Invalid GZ_IP [{}]: {}", gz_ip, err);
+                    }
+                }
             }
         } else {
             // Get the list of network interfaces in this host.
@@ -136,45 +152,49 @@ impl Discovery {
     where
         F: Fn(DiscoveryPublisher) + Send + Sync + 'static,
     {
-        self.connection_cb
-            .lock()
-            .unwrap()
-            .replace(Box::new(callback));
+        if let Ok(mut cb) = self.connection_cb.lock() {
+            cb.replace(Box::new(callback));
+        } else {
+            error!("Failed to lock connection_cb");
+        }
     }
 
     pub(crate) fn set_disconnection_cb<F>(&mut self, callback: F)
     where
         F: Fn(DiscoveryPublisher) + Send + Sync + 'static,
     {
-        self.disconnection_cb
-            .lock()
-            .unwrap()
-            .replace(Box::new(callback));
+        if let Ok(mut cb) = self.disconnection_cb.lock() {
+            cb.replace(Box::new(callback));
+        } else {
+            error!("Failed to lock disconnection_cb");
+        }
     }
 
     pub(crate) fn set_registration_cb<F>(&mut self, callback: F)
     where
         F: Fn(DiscoveryPublisher) + Send + Sync + 'static,
     {
-        self.registration_cb
-            .lock()
-            .unwrap()
-            .replace(Box::new(callback));
+        if let Ok(mut cb) = self.registration_cb.lock() {
+            cb.replace(Box::new(callback));
+        } else {
+            error!("Failed to lock registration_cb");
+        }
     }
 
     pub(crate) fn set_unregistration_cb<F>(&mut self, callback: F)
     where
         F: Fn(DiscoveryPublisher) + Send + Sync + 'static,
     {
-        self.unregistration_cb
-            .lock()
-            .unwrap()
-            .replace(Box::new(callback));
+        if let Ok(mut cb) = self.unregistration_cb.lock() {
+            cb.replace(Box::new(callback));
+        } else {
+            error!("Failed to lock unregistration_cb");
+        }
     }
 
     pub fn advertise(&self, discovery_publisher: DiscoveryPublisher) -> Result<()> {
         {
-            let mut store = self.discovery_store.lock().unwrap();
+            let mut store = lock_mutex(&self.discovery_store, "discovery_store")?;
             if let Err(e) = store.add_publisher(discovery_publisher.clone()) {
                 bail!("Failed to add publisher: {}", e);
             }
@@ -199,7 +219,7 @@ impl Discovery {
 
     pub fn unadvertise(&self, topic: &str, n_uuid: &str) -> Result<()> {
         let publisher = {
-            let mut store = self.discovery_store.lock().unwrap();
+            let mut store = lock_mutex(&self.discovery_store, "discovery_store")?;
             if let Some(p) = store.publisher(topic, &self.p_uuid, n_uuid) {
                 let publisher = p.clone();
                 store.del_publisher_by_node(topic, &self.p_uuid, n_uuid)?;
@@ -242,7 +262,7 @@ impl Discovery {
             })?;
 
             let publishers = {
-                let store = self.discovery_store.lock().unwrap();
+                let store = lock_mutex(&self.discovery_store, "discovery_store")?;
                 let mut v = vec![];
                 for p in store.publishers(Some(topic), None, None) {
                     v.push(p.clone())
@@ -251,7 +271,7 @@ impl Discovery {
             };
 
             for p in publishers {
-                if let Some(cb) = self.connection_cb.lock().unwrap().as_ref() {
+                if let Some(cb) = lock_mutex(&self.connection_cb, "connection_cb")?.as_ref() {
                     cb(p.clone());
                 }
             }
@@ -284,7 +304,13 @@ impl Discovery {
 
     // Get all the publishers' information known for a given topic.
     pub fn publishers(&self, topic: &str) -> Option<Vec<DiscoveryPublisher>> {
-        let store = self.discovery_store.lock().unwrap();
+        let store = match self.discovery_store.lock() {
+            Ok(store) => store,
+            Err(err) => {
+                error!("Failed to lock discovery_store: {}", err);
+                return None;
+            }
+        };
         let publishers: Vec<DiscoveryPublisher> = store
             .publishers(Some(topic), None, None)
             .into_iter()
@@ -300,13 +326,17 @@ impl Discovery {
 
     // Get the list of topics currently advertised in the network.
     pub fn topic_list(&self) -> Vec<String> {
-        self.discovery_store
-            .lock()
-            .unwrap()
-            .topic_list()
-            .into_iter()
-            .map(|s| s.to_string())
-            .collect()
+        match self.discovery_store.lock() {
+            Ok(store) => store
+                .topic_list()
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect(),
+            Err(err) => {
+                error!("Failed to lock discovery_store: {}", err);
+                Vec::new()
+            }
+        }
     }
 
     pub fn host_addr(&self) -> &Ipv4Addr {
@@ -314,9 +344,10 @@ impl Discovery {
     }
 
     pub fn print_current_state(&self) {
-        {
-            let store = self.discovery_store.lock().unwrap();
+        if let Ok(store) = self.discovery_store.lock() {
             store.print();
+        } else {
+            error!("Failed to lock discovery_store for print_current_state");
         }
     }
 
@@ -427,7 +458,7 @@ impl Discovery {
         for net_iface in self.host_interfaces.iter() {
             if let Err(_err) = socket.join_multicast_v4(self.multicast_addr.ip(), net_iface) {
                 if net_iface == &self.host_addr {
-                    let addr = "127.0.0.1:0".parse::<SocketAddrV4>().unwrap();
+                    let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
                     socket.join_multicast_v4(self.multicast_addr.ip(), addr.ip())?;
                     error!(
                         "Did you set the environment variable GZ_IP with a correct IP address? "
@@ -550,7 +581,10 @@ impl DiscoveryInner {
         if addr.is_ipv6() {
             bail!("Received an IPv6 discovery message.");
         }
-        let from_ip: Ipv4Addr = addr.ip().to_string().parse().unwrap();
+        let from_ip = match addr.ip() {
+            IpAddr::V4(ip) => ip,
+            IpAddr::V6(_) => bail!("Received an IPv6 discovery message."),
+        };
         let msg = match discovery_msg_decode(&mut rcv_str, len) {
             Ok(msg) => msg,
             Err(e) => {
@@ -577,7 +611,7 @@ impl DiscoveryInner {
 
         // Re-advertise topics that are advertised inside this process.
         let publishers = {
-            let store = self.discovery_store.lock().unwrap();
+            let store = lock_mutex(&self.discovery_store, "discovery_store")?;
             let mut v = vec![];
             for p in store.publishers_by_process(&self.p_uuid) {
                 v.push(p.clone())
@@ -596,7 +630,7 @@ impl DiscoveryInner {
     async fn update_activity(&self) -> Result<()> {
         // Identify inactive processes and remove them from the activity map.
         let inactive_processes = {
-            let mut activity = self.activity.lock().unwrap();
+            let mut activity = lock_mutex(&self.activity, "activity")?;
             let mut v = vec![];
             activity.retain(|process_uuid, last_activity| {
                 if last_activity.elapsed().as_millis() > self.silence_interval as u128 {
@@ -612,7 +646,7 @@ impl DiscoveryInner {
 
         // Remove publishers related to inactive processes.
         let disconnect_processes = {
-            let mut store = self.discovery_store.lock().unwrap();
+            let mut store = lock_mutex(&self.discovery_store, "discovery_store")?;
             inactive_processes
                 .into_iter()
                 .filter(|process_uuid| {
@@ -627,7 +661,7 @@ impl DiscoveryInner {
         };
 
         // Trigger the disconnection callback.
-        if let Some(cb) = self.disconnection_cb.lock().unwrap().as_ref() {
+        if let Some(cb) = lock_mutex(&self.disconnection_cb, "disconnection_cb")?.as_ref() {
             for process_uuid in &disconnect_processes {
                 let publisher = DiscoveryPublisher {
                     process_uuid: process_uuid.clone(),
@@ -668,7 +702,7 @@ impl DiscoveryInner {
                 // A unicast peer contacted me. I need to save its address for
                 // sending future messages in the future.
                 {
-                    let mut relay_addrs = self.relay_addrs.lock().unwrap();
+                    let mut relay_addrs = lock_mutex(&self.relay_addrs, "relay_addrs")?;
                     let addr = SocketAddrV4::new(from_ip, self.multicast_addr.port());
                     relay_addrs.insert(addr);
                 }
@@ -689,7 +723,7 @@ impl DiscoveryInner {
         }
 
         {
-            let mut activity = self.activity.lock().unwrap();
+            let mut activity = lock_mutex(&self.activity, "activity")?;
             activity.insert(msg.process_uuid.clone(), Instant::now());
         }
 
@@ -719,11 +753,12 @@ impl DiscoveryInner {
                 match self
                     .discovery_store
                     .lock()
-                    .unwrap()
+                    .map_err(|err| anyhow::anyhow!("Failed to lock discovery_store: {}", err))?
                     .add_publisher(publisher.clone())
                 {
                     Ok(_) => {
-                        if let Some(cb) = self.connection_cb.lock().unwrap().as_ref() {
+                        if let Some(cb) = lock_mutex(&self.connection_cb, "connection_cb")?.as_ref()
+                        {
                             cb(publisher.clone());
                         }
                     }
@@ -740,7 +775,7 @@ impl DiscoveryInner {
                     // Get registered publishers from the same process.
                     let publishers = {
                         let mut v = vec![];
-                        let store = self.discovery_store.lock().unwrap();
+                        let store = lock_mutex(&self.discovery_store, "discovery_store")?;
                         for p in store.publishers(Some(recv_topic), Some(&msg.process_uuid), None) {
                             if let Ok(scope) = DiscoveryScope::try_from(p.scope) {
                                 if scope == DiscoveryScope::Process
@@ -762,12 +797,13 @@ impl DiscoveryInner {
                 }
             }
             DiscoveryType::NewConnection => {
-                if let Some(cb) = self.registration_cb.lock().unwrap().as_ref() {
+                if let Some(cb) = lock_mutex(&self.registration_cb, "registration_cb")?.as_ref() {
                     cb(publisher.clone());
                 }
             }
             DiscoveryType::EndConnection => {
-                if let Some(cb) = self.unregistration_cb.lock().unwrap().as_ref() {
+                if let Some(cb) = lock_mutex(&self.unregistration_cb, "unregistration_cb")?.as_ref()
+                {
                     cb(publisher.clone());
                 }
             }
@@ -777,19 +813,19 @@ impl DiscoveryInner {
             DiscoveryType::Bye => {
                 // Remove the activity entry for this publisher.
                 {
-                    let mut activity = self.activity.lock().unwrap();
+                    let mut activity = lock_mutex(&self.activity, "activity")?;
                     activity.remove(&msg.process_uuid);
                 }
                 // Notify the new disconnection.
                 publisher.process_uuid = msg.process_uuid.clone();
 
-                if let Some(cb) = self.disconnection_cb.lock().unwrap().as_ref() {
+                if let Some(cb) = lock_mutex(&self.disconnection_cb, "disconnection_cb")?.as_ref() {
                     cb(publisher.clone());
                 }
 
                 // Remove the address entry for this topic.
                 {
-                    let mut store = self.discovery_store.lock().unwrap();
+                    let mut store = lock_mutex(&self.discovery_store, "discovery_store")?;
                     if let Err(e) = store.del_publishers_by_process(&msg.process_uuid) {
                         debug!("Failed to remove publisher: {}", e);
                     }
@@ -803,12 +839,12 @@ impl DiscoveryInner {
                     return Ok(()); // Discard the message.
                 }
 
-                if let Some(cb) = self.disconnection_cb.lock().unwrap().as_ref() {
+                if let Some(cb) = lock_mutex(&self.disconnection_cb, "disconnection_cb")?.as_ref() {
                     cb(publisher.clone());
                 }
 
                 {
-                    let mut store = self.discovery_store.lock().unwrap();
+                    let mut store = lock_mutex(&self.discovery_store, "discovery_store")?;
                     if let Err(e) = store.del_publisher_by_node(
                         &publisher.topic,
                         &publisher.process_uuid,
@@ -892,9 +928,7 @@ impl DiscoveryInner {
 
     async fn send_unicast(&self, msg: &DiscoveryMsg) -> Result<()> {
         let addrs = {
-            self.relay_addrs
-                .lock()
-                .unwrap()
+            lock_mutex(&self.relay_addrs, "relay_addrs")?
                 .iter()
                 .copied()
                 .collect::<Vec<_>>()
