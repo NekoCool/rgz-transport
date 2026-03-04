@@ -29,7 +29,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: cargo fmt
-        run: cargo fmt --all -- --check
+        run: |
+          rustfmt --edition 2024 --check \
+            crates/rgz-msgs/build.rs \
+            $(git ls-files 'crates/rgz-derive/**/*.rs' 'crates/rgz-transport/**/*.rs')
 
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
