@@ -84,7 +84,10 @@ impl Node {
         };
 
         let event_sender = {
-            let mut node_shared = self.node_shared.lock().unwrap();
+            let mut node_shared = self
+                .node_shared
+                .lock()
+                .map_err(|err| anyhow::anyhow!("Failed to lock node_shared: {}", err))?;
             node_shared.advertise(discovery_publisher)?
         };
 
@@ -103,7 +106,10 @@ impl Node {
         let fully_qualified_topic = self.create_fully_qualified_topic(topic)?;
         let (msg_sender, mut msg_receiver) = mpsc::unbounded_channel::<PublishMessage>();
         {
-            let mut node_shared = self.node_shared.lock().unwrap();
+            let mut node_shared = self
+                .node_shared
+                .lock()
+                .map_err(|err| anyhow::anyhow!("Failed to lock node_shared: {}", err))?;
             node_shared.subscribe(SubscribeArgs {
                 n_uuid: self.n_uuid.to_string(),
                 topic: fully_qualified_topic.clone(),
@@ -166,7 +172,10 @@ impl Node {
         let (request_sender, mut request_receiver) = mpsc::unbounded_channel::<RequestMessage>();
 
         let event_sender = {
-            let mut node_shared = self.node_shared.lock().unwrap();
+            let mut node_shared = self
+                .node_shared
+                .lock()
+                .map_err(|err| anyhow::anyhow!("Failed to lock node_shared: {}", err))?;
             node_shared.advertise_service(discovery_publisher, request_sender)?
         };
 
@@ -230,7 +239,10 @@ impl Node {
         };
 
         let response_receiver = {
-            let mut node_shared = self.node_shared.lock().unwrap();
+            let mut node_shared = self
+                .node_shared
+                .lock()
+                .map_err(|err| anyhow::anyhow!("Failed to lock node_shared: {}", err))?;
             node_shared.request(RequestMessage {
                 replier_address: None,
                 replier_id: "unset".to_string(),

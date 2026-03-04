@@ -5,7 +5,7 @@ use std::thread;
 use std::thread::sleep;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use tracing::{debug, error};
 
 /// Timeout used for receiving messages (ms.).
@@ -86,28 +86,28 @@ pub(crate) struct Transporter {
 }
 
 impl Transporter {
-    pub(crate) fn new(host_addr: &str) -> Self {
+    pub(crate) fn new(host_addr: &str) -> Result<Self> {
         let any_tcp = format!("tcp://{}:*", host_addr);
         let context = zmq::Context::new();
-        let publisher = context.socket(zmq::PUB).unwrap();
+        let publisher = context.socket(zmq::PUB)?;
         let linger_val = 0;
-        publisher.set_linger(linger_val).unwrap();
-        publisher.set_sndhwm(DEFAULT_SND_HWM).unwrap();
-        publisher.bind(&any_tcp).expect("failed binding publisher");
+        publisher.set_linger(linger_val)?;
+        publisher.set_sndhwm(DEFAULT_SND_HWM)?;
+        publisher.bind(&any_tcp)?;
 
         let publisher_address = match publisher.get_last_endpoint() {
             Ok(Ok(endpoint)) => endpoint,
             _ => "".to_string(),
         };
-        let requester = context.socket(zmq::ROUTER).unwrap();
-        requester.set_linger(linger_val).unwrap();
-        requester.set_router_mandatory(true).unwrap();
+        let requester = context.socket(zmq::ROUTER)?;
+        requester.set_linger(linger_val)?;
+        requester.set_router_mandatory(true)?;
         let requester_id = uuid::Uuid::new_v4().to_string();
         let requester_address = Arc::new(Mutex::new("unset".to_string()));
         let replier_id = uuid::Uuid::new_v4().to_string();
         let replier_address = Arc::new(Mutex::new("unset".to_string()));
 
-        Transporter {
+        Ok(Transporter {
             host_addr: host_addr.to_string(),
             context,
             publisher,
@@ -124,7 +124,7 @@ impl Transporter {
             response_handler: Arc::new(Mutex::new(None)),
             subscribe_evt_sender: None,
             reply_msg_sender: None,
-        }
+        })
     }
 
     pub(crate) fn publisher_address(&self) -> String {
@@ -132,7 +132,13 @@ impl Transporter {
     }
 
     pub(crate) fn replier_address(&self) -> String {
-        self.replier_address.lock().unwrap().clone()
+        match self.replier_address.lock() {
+            Ok(address) => address.clone(),
+            Err(err) => {
+                error!("Failed to lock replier_address: {}", err);
+                String::new()
+            }
+        }
     }
     pub(crate) fn replier_id(&self) -> String {
         self.replier_id.clone()
@@ -146,25 +152,37 @@ impl Transporter {
         unsubscribe_topic: Option<&str>,
     ) {
         if let Some(event_sender) = self.subscribe_evt_sender.as_ref() {
-            event_sender
-                .send(SubscribeEvent {
-                    connect: connect.map(|s| s.to_string()),
-                    disconnect: disconnect.map(|s| s.to_string()),
-                    subscribe: subscribe_topic.map(|s| s.to_string()),
-                    unsubscribe: unsubscribe_topic.map(|s| s.to_string()),
-                })
-                .expect("subscribe failed");
+            if let Err(err) = event_sender.send(SubscribeEvent {
+                connect: connect.map(|s| s.to_string()),
+                disconnect: disconnect.map(|s| s.to_string()),
+                subscribe: subscribe_topic.map(|s| s.to_string()),
+                unsubscribe: unsubscribe_topic.map(|s| s.to_string()),
+            }) {
+                error!("Failed to enqueue subscribe event: {}", err);
+            }
         } else {
             error!("There is no sender. Transporter may not have started.");
         }
     }
 
     pub(crate) fn connections(&self) -> Vec<String> {
-        let connections = self.connections.lock().unwrap();
-        connections.iter().cloned().collect()
+        match self.connections.lock() {
+            Ok(connections) => connections.iter().cloned().collect(),
+            Err(err) => {
+                error!("Failed to lock connections: {}", err);
+                Vec::new()
+            }
+        }
     }
     pub(crate) fn srv_disconnect(&self, address: &str) {
-        self.srv_connections.lock().unwrap().remove(address);
+        if let Ok(mut srv_connections) = self.srv_connections.lock() {
+            srv_connections.remove(address);
+        } else {
+            error!(
+                "Failed to lock srv_connections while disconnecting [{}]",
+                address
+            );
+        }
     }
 
     pub(crate) fn publish(&self, publish_message: PublishMessage) -> Result<()> {
@@ -192,7 +210,10 @@ impl Transporter {
         };
 
         {
-            let mut srv_connections = self.srv_connections.lock().unwrap();
+            let mut srv_connections = self
+                .srv_connections
+                .lock()
+                .map_err(|err| anyhow::anyhow!("Failed to lock srv_connections: {}", err))?;
             if srv_connections.insert(address.clone()) {
                 self.requester.connect(&address)?;
                 debug!("Connected to [{}] for service requests", address);
@@ -200,7 +221,11 @@ impl Transporter {
             }
         }
 
-        let my_requester_address = self.requester_address.lock().unwrap().clone();
+        let my_requester_address = self
+            .requester_address
+            .lock()
+            .map_err(|err| anyhow::anyhow!("Failed to lock requester_address: {}", err))?
+            .clone();
         let messages = [
             zmq::Message::from(&msg.replier_id),
             zmq::Message::from(&msg.topic),
@@ -235,30 +260,36 @@ impl Transporter {
     where
         F: Fn(PublishMessage) + Send + 'static,
     {
-        self.subscription_handler
-            .lock()
-            .unwrap()
-            .replace(Box::new(handler));
+        match self.subscription_handler.lock() {
+            Ok(mut h) => {
+                h.replace(Box::new(handler));
+            }
+            Err(err) => error!("Failed to lock subscription_handler: {}", err),
+        }
     }
 
     pub(crate) fn set_request_handler<F>(&mut self, handler: F)
     where
         F: Fn(RequestMessage) + Send + 'static,
     {
-        self.request_handler
-            .lock()
-            .unwrap()
-            .replace(Box::new(handler));
+        match self.request_handler.lock() {
+            Ok(mut h) => {
+                h.replace(Box::new(handler));
+            }
+            Err(err) => error!("Failed to lock request_handler: {}", err),
+        }
     }
 
     pub(crate) fn set_response_handler<F>(&mut self, handler: F)
     where
         F: Fn(ReplyMessage) + Send + 'static,
     {
-        self.response_handler
-            .lock()
-            .unwrap()
-            .replace(Box::new(handler));
+        match self.response_handler.lock() {
+            Ok(mut h) => {
+                h.replace(Box::new(handler));
+            }
+            Err(err) => error!("Failed to lock response_handler: {}", err),
+        }
     }
 
     pub(crate) fn start(&mut self) {
@@ -280,7 +311,7 @@ impl Transporter {
         let response_handler = self.response_handler.clone();
 
         thread::spawn(move || {
-            let mut inner = TransporterInner::new(
+            let mut inner = match TransporterInner::new(
                 context,
                 &host_addr,
                 &requester_id,
@@ -292,7 +323,13 @@ impl Transporter {
                 subscription_handler,
                 request_handler,
                 response_handler,
-            );
+            ) {
+                Ok(inner) => inner,
+                Err(err) => {
+                    error!("Failed to initialize transport thread: {}", err);
+                    return;
+                }
+            };
 
             loop {
                 if let Ok(event) = subscribe_evt_receiver.try_recv() {
@@ -324,7 +361,9 @@ impl Transporter {
                     error!("failed replying: {}", e);
                 }
 
-                inner.poll(TIMEOUT).expect("poll failed");
+                if let Err(err) = inner.poll(TIMEOUT) {
+                    error!("Transport poll failed: {}", err);
+                }
             }
         });
     }
@@ -362,42 +401,46 @@ impl TransporterInner {
         subscription_handler: Arc<Mutex<Option<SubscriptionHandlerType>>>,
         request_handler: Arc<Mutex<Option<RequestHandlerType>>>,
         response_handler: Arc<Mutex<Option<ResponseHandlerType>>>,
-    ) -> Self {
+    ) -> Result<Self> {
         let any_tcp = format!("tcp://{}:*", host_addr);
         let requester_id = requester_id.to_string();
         let replier_id = replier_id.to_string();
 
-        let subscriber = context.socket(zmq::SUB).unwrap();
-        let response_receiver = context.socket(zmq::ROUTER).unwrap();
-        let replier = context.socket(zmq::ROUTER).unwrap();
+        let subscriber = context.socket(zmq::SUB)?;
+        let response_receiver = context.socket(zmq::ROUTER)?;
+        let replier = context.socket(zmq::ROUTER)?;
 
-        subscriber.set_rcvhwm(DEFAULT_RCV_HWM).unwrap();
+        subscriber.set_rcvhwm(DEFAULT_RCV_HWM)?;
 
         response_receiver
             .set_identity(requester_id.as_bytes())
-            .unwrap();
-        response_receiver
-            .bind(&any_tcp)
-            .expect("failed binding response_receiver");
+            .context("Failed setting response receiver identity")?;
+        response_receiver.bind(&any_tcp)?;
         let address = match response_receiver.get_last_endpoint() {
             Ok(Ok(endpoint)) => endpoint,
             _ => "error".to_string(),
         };
-        *requester_address.lock().unwrap() = address.clone();
+        *requester_address
+            .lock()
+            .map_err(|err| anyhow::anyhow!("Failed to lock requester_address: {}", err))? =
+            address.clone();
 
-        replier.set_identity(replier_id.as_bytes()).unwrap();
+        replier.set_identity(replier_id.as_bytes())?;
         let linger_val = 0;
-        replier.set_linger(linger_val).unwrap();
+        replier.set_linger(linger_val)?;
         let route_on = true;
-        replier.set_router_mandatory(route_on).unwrap();
-        replier.bind(&any_tcp).expect("failed binding replier");
+        replier.set_router_mandatory(route_on)?;
+        replier.bind(&any_tcp)?;
         let address = match replier.get_last_endpoint() {
             Ok(Ok(endpoint)) => endpoint,
             _ => "".to_string(),
         };
-        *replier_address.lock().unwrap() = address.clone();
+        *replier_address
+            .lock()
+            .map_err(|err| anyhow::anyhow!("Failed to lock replier_address: {}", err))? =
+            address.clone();
 
-        TransporterInner {
+        Ok(TransporterInner {
             subscriber,
             response_receiver,
             replier,
@@ -410,11 +453,14 @@ impl TransporterInner {
             subscription_handler,
             request_handler,
             response_handler,
-        }
+        })
     }
 
     fn connect(&self, address: &str) -> Result<()> {
-        let mut connections = self.connections.lock().unwrap();
+        let mut connections = self
+            .connections
+            .lock()
+            .map_err(|err| anyhow::anyhow!("Failed to lock connections: {}", err))?;
         if connections.insert(address.to_string()) {
             self.subscriber.connect(address)?;
             debug!("Connected to [{}] for subscriptions", address);
@@ -424,7 +470,10 @@ impl TransporterInner {
         Ok(())
     }
     fn disconnect(&self, address: &str) -> Result<()> {
-        self.connections.lock().unwrap().remove(address);
+        self.connections
+            .lock()
+            .map_err(|err| anyhow::anyhow!("Failed to lock connections: {}", err))?
+            .remove(address);
         self.subscriber.disconnect(address)?;
         Ok(())
     }
@@ -446,7 +495,10 @@ impl TransporterInner {
         };
 
         {
-            let mut srv_connections = self.srv_connections.lock().unwrap();
+            let mut srv_connections = self
+                .srv_connections
+                .lock()
+                .map_err(|err| anyhow::anyhow!("Failed to lock srv_connections: {}", err))?;
             if srv_connections.insert(address.clone()) {
                 self.replier.connect(&address)?;
                 debug!("Connected to [{}] for service response", address);
@@ -500,7 +552,12 @@ impl TransporterInner {
         let data = self.subscriber.recv_msg(0)?;
         let msg_type = self.subscriber.recv_msg(0)?;
 
-        if let Some(handler) = self.subscription_handler.lock().unwrap().as_ref() {
+        if let Some(handler) = self
+            .subscription_handler
+            .lock()
+            .map_err(|err| anyhow::anyhow!("Failed to lock subscription_handler: {}", err))?
+            .as_ref()
+        {
             handler(PublishMessage {
                 topic: topic.as_str().unwrap_or("").to_string(),
                 data: data.to_vec(),
@@ -522,7 +579,12 @@ impl TransporterInner {
         let req_type = self.replier.recv_msg(0)?;
         let res_type = self.replier.recv_msg(0)?;
 
-        if let Some(handler) = self.request_handler.lock().unwrap().as_ref() {
+        if let Some(handler) = self
+            .request_handler
+            .lock()
+            .map_err(|err| anyhow::anyhow!("Failed to lock request_handler: {}", err))?
+            .as_ref()
+        {
             handler(RequestMessage {
                 replier_address: None,
                 replier_id: replier_id.as_str().unwrap_or("").to_string(),
@@ -541,13 +603,18 @@ impl TransporterInner {
 
     fn on_response(&self) -> Result<()> {
         let requester_id = self.response_receiver.recv_msg(0)?;
-        let topic = self.response_receiver.recv_msg(0).unwrap();
-        let node_uuid = self.response_receiver.recv_msg(0).unwrap();
-        let req_uuid = self.response_receiver.recv_msg(0).unwrap();
-        let data = self.response_receiver.recv_msg(0).unwrap();
-        let result_str = self.response_receiver.recv_msg(0).unwrap();
+        let topic = self.response_receiver.recv_msg(0)?;
+        let node_uuid = self.response_receiver.recv_msg(0)?;
+        let req_uuid = self.response_receiver.recv_msg(0)?;
+        let data = self.response_receiver.recv_msg(0)?;
+        let result_str = self.response_receiver.recv_msg(0)?;
 
-        if let Some(handler) = self.response_handler.lock().unwrap().as_ref() {
+        if let Some(handler) = self
+            .response_handler
+            .lock()
+            .map_err(|err| anyhow::anyhow!("Failed to lock response_handler: {}", err))?
+            .as_ref()
+        {
             handler(ReplyMessage {
                 requester_address: None,
                 requester_id: requester_id.as_str().unwrap_or("").to_string(),

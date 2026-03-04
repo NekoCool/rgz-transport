@@ -137,37 +137,37 @@ impl DiscoveryStore {
         p_uuid: Option<&str>,
         n_uuid: Option<&str>,
     ) -> Vec<&DiscoveryPublisher> {
-        match (topic.is_some(), p_uuid.is_some(), n_uuid.is_some()) {
-            (true, true, true) => self
-                .publisher(topic.unwrap(), p_uuid.unwrap(), n_uuid.unwrap())
+        match (topic, p_uuid, n_uuid) {
+            (Some(topic), Some(p_uuid), Some(n_uuid)) => self
+                .publisher(topic, p_uuid, n_uuid)
                 .map(|p| vec![p])
-                .unwrap_or(vec![]),
-            (true, true, false) => match self.discovery_publishers.get(topic.unwrap()) {
+                .unwrap_or_default(),
+            (Some(topic), Some(p_uuid), None) => match self.discovery_publishers.get(topic) {
                 Some(process) => process
-                    .get(p_uuid.unwrap())
+                    .get(p_uuid)
                     .map(|p| p.iter().collect())
-                    .unwrap_or(vec![]),
+                    .unwrap_or_default(),
                 None => vec![],
             },
-            (true, false, false) => self.publishers_by_topic(topic.unwrap()),
-            (true, false, true) => match self.discovery_publishers.get(topic.unwrap()) {
+            (Some(topic), None, None) => self.publishers_by_topic(topic),
+            (Some(topic), None, Some(n_uuid)) => match self.discovery_publishers.get(topic) {
                 Some(process) => process
                     .values()
                     .flat_map(|p| p.iter())
-                    .filter(|p| p.node_uuid == n_uuid.unwrap())
+                    .filter(|p| p.node_uuid == n_uuid)
                     .collect(),
                 None => vec![],
             },
-            (false, true, false) => self.publishers_by_process(p_uuid.unwrap()),
-            (false, true, true) => self.publishers_by_node(p_uuid.unwrap(), n_uuid.unwrap()),
-            (false, false, true) => self
+            (None, Some(p_uuid), None) => self.publishers_by_process(p_uuid),
+            (None, Some(p_uuid), Some(n_uuid)) => self.publishers_by_node(p_uuid, n_uuid),
+            (None, None, Some(n_uuid)) => self
                 .discovery_publishers
                 .values()
                 .flat_map(|p| p.values())
                 .flatten()
-                .filter(|p| p.node_uuid == n_uuid.unwrap())
+                .filter(|p| p.node_uuid == n_uuid)
                 .collect(),
-            (false, false, false) => self
+            (None, None, None) => self
                 .discovery_publishers
                 .values()
                 .flat_map(|p| p.values())
