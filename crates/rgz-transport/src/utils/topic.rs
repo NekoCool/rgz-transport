@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use regex::Regex;
 
 const MAX_NAME_LENGTH: usize = u16::MAX as usize;
@@ -67,7 +67,7 @@ pub(crate) fn fully_qualified_name(partition: &str, ns: &str, topic: &str) -> Re
     let mut topic = topic.to_string();
 
     // If partition is not empty and does not start with slash, add it.
-    if !partition.is_empty() && partition.chars().nth(0) != Some('/') {
+    if !partition.is_empty() && !partition.starts_with('/') {
         partition.insert(0, '/');
     }
     // If the partition contains a trailing slash, remove it.
@@ -75,12 +75,12 @@ pub(crate) fn fully_qualified_name(partition: &str, ns: &str, topic: &str) -> Re
         partition.pop();
     }
     // If the namespace does not contain a trailing slash, append it.
-    if ns.is_empty() || ns.chars().last() != Some('/') {
+    if ns.is_empty() || !ns.ends_with('/') {
         ns.push('/');
     }
 
     // If the namespace does not start with slash, add it.
-    if ns.is_empty() || ns.chars().nth(0) != Some('/') {
+    if ns.is_empty() || !ns.starts_with('/') {
         ns.insert(0, '/');
     }
 
@@ -93,7 +93,7 @@ pub(crate) fn fully_qualified_name(partition: &str, ns: &str, topic: &str) -> Re
 
     // If the topic does starts with '/' is considered an absolute topic and the
     // namespace will not be prefixed.
-    if !topic.is_empty() && topic.chars().nth(0) == Some('/') {
+    if !topic.is_empty() && topic.starts_with('/') {
         name.push_str(&topic);
     } else {
         name.push_str(&ns);
@@ -133,13 +133,13 @@ fn decompose_fully_qualified_topic(fully_qualified_name: &str) -> Result<(String
 fn as_valid_topic(topic: &str) -> Result<String> {
     // Substitute spaces with _
     let re_space = Regex::new(r"\s").unwrap();
-    let valid_topic = re_space.replace_all(&topic, "_").to_string();
+    let valid_topic = re_space.replace_all(topic, "_").to_string();
 
     // Remove special characters and combinations
     let re_special_chars = Regex::new(r"@|~|//|:=").unwrap();
     let mut valid_topic = re_special_chars.replace_all(&valid_topic, "").to_string();
 
-    if !valid_topic.is_empty() && valid_topic.chars().nth(0) != Some('/') {
+    if !valid_topic.is_empty() && !valid_topic.starts_with('/') {
         valid_topic.insert(0, '/');
     }
 
@@ -187,7 +187,7 @@ mod tests {
     #[test]
     fn test_as_valid_topic() {
         let namespace_and_topic = "//example/namespace/my topic";
-        let valid_topic = as_valid_topic(&namespace_and_topic).unwrap();
+        let valid_topic = as_valid_topic(namespace_and_topic).unwrap();
 
         assert_eq!(valid_topic, "/example/namespace/my_topic");
     }

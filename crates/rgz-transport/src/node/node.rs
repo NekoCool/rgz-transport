@@ -1,13 +1,12 @@
-use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use tokio::sync::mpsc::{self, UnboundedSender};
-use tokio::time::{timeout_at, Instant};
-use tracing::{error};
+use tokio::time::{Instant, timeout_at};
+use tracing::error;
 
 use crate::discovery::{
     DiscoveryMsgPublisher, DiscoveryPubType, DiscoveryPublisher, DiscoverySrvPublisher,
@@ -60,8 +59,8 @@ impl Node {
         topic: &str,
         options: Option<AdvertiseOptions>,
     ) -> Result<Publisher<T>>
-        where
-            T: GzMessage,
+    where
+        T: GzMessage,
     {
         let advertise_options = options.unwrap_or_default();
         let fully_qualified_topic = self.create_fully_qualified_topic(topic)?;
@@ -97,13 +96,12 @@ impl Node {
     }
 
     pub fn subscribe<T, F>(&mut self, topic: &str, mut cb: F) -> Result<()>
-        where
-            T: GzMessage + Default,
-            F: FnMut(T) + Send + 'static,
+    where
+        T: GzMessage + Default,
+        F: FnMut(T) + Send + 'static,
     {
         let fully_qualified_topic = self.create_fully_qualified_topic(topic)?;
-        let (msg_sender, mut msg_receiver) =
-            mpsc::unbounded_channel::<PublishMessage>();
+        let (msg_sender, mut msg_receiver) = mpsc::unbounded_channel::<PublishMessage>();
         {
             let mut node_shared = self.node_shared.lock().unwrap();
             node_shared.subscribe(SubscribeArgs {
@@ -115,7 +113,7 @@ impl Node {
         };
 
         tokio::spawn(async move {
-            while let Some(mut msgs) = msg_receiver.recv().await {
+            while let Some(msgs) = msg_receiver.recv().await {
                 if let Ok(msg) = T::decode(&msgs.data[..]) {
                     cb(msg);
                 } else {
@@ -127,12 +125,15 @@ impl Node {
     }
 
     pub fn advertise_service<REQ, RES, F>(
-        &self, topic: &str, mut cb: F, options: Option<AdvertiseOptions>,
+        &self,
+        topic: &str,
+        mut cb: F,
+        options: Option<AdvertiseOptions>,
     ) -> Result<()>
-        where
-            REQ: GzMessage + Default,
-            RES: GzMessage + Default,
-            F: FnMut(REQ) -> Result<RES> + Send + 'static,
+    where
+        REQ: GzMessage + Default,
+        RES: GzMessage + Default,
+        F: FnMut(REQ) -> Result<RES> + Send + 'static,
     {
         let advertise_options = options.unwrap_or_default();
 
@@ -170,7 +171,7 @@ impl Node {
         };
 
         tokio::spawn(async move {
-            while let Some(mut msgs) = request_receiver.recv().await {
+            while let Some(msgs) = request_receiver.recv().await {
                 if let Ok(msg) = REQ::decode(&msgs.data[..]) {
                     let mut data = vec![];
                     let mut result = false;
@@ -191,8 +192,7 @@ impl Node {
                         req_uuid: msgs.req_uuid.to_string(),
                         data,
                         result,
-                    }))
-                    {
+                    })) {
                         error!("Failed to send reply: {}", e);
                     }
                 } else {
@@ -209,9 +209,9 @@ impl Node {
         request: Option<REQ>,
         timeout: Option<Duration>,
     ) -> Result<Option<RES>>
-        where
-            REQ: GzMessage + Default,
-            RES: GzMessage + Default,
+    where
+        REQ: GzMessage + Default,
+        RES: GzMessage + Default,
     {
         let timeout = timeout.unwrap_or(Duration::from_millis(1000));
 
@@ -224,7 +224,7 @@ impl Node {
         }
         let fully_qualified_topic = topic_utils::fully_qualified_name(partition, ns, &topic)?;
 
-        let mut data = match request {
+        let data = match request {
             Some(req) => req.encode_to_vec(),
             None => vec![],
         };
@@ -272,8 +272,8 @@ pub struct Publisher<T> {
 }
 
 impl<T> Publisher<T>
-    where
-        T: GzMessage,
+where
+    T: GzMessage,
 {
     fn new(topic: &str, options: AdvertiseOptions, sender: UnboundedSender<NodeEvent>) -> Self {
         let is_ready = Arc::new(AtomicBool::new(false));
@@ -318,14 +318,6 @@ impl<T> Publisher<T>
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-    use tokio::time::sleep;
-    use rgz_msgs::StringMsg;
-
-    use futures::stream::StreamExt;
-    use futures::channel::mpsc::channel as futures_channel;
-
-    use super::*;
 
     #[cfg(feature = "network-tests")]
     #[ignore = "requires network"]
@@ -338,7 +330,8 @@ mod tests {
         let m = recv_msg.clone();
         node.subscribe(topic, move |msg: StringMsg| {
             *m.lock().unwrap() = Some(msg);
-        }).unwrap();
+        })
+        .unwrap();
 
         let publisher = node.advertise::<StringMsg>(topic, None).unwrap();
         while !publisher.is_ready() {
@@ -375,7 +368,8 @@ mod tests {
             if let Err(e) = sender.try_send(msg) {
                 eprintln!("error: {}", e);
             }
-        }).unwrap();
+        })
+        .unwrap();
 
         let publisher = node.advertise::<StringMsg>(topic, None).unwrap();
         while !publisher.is_ready() {
@@ -400,9 +394,8 @@ mod tests {
     async fn test_req_res() {
         let topic = "/echo";
         let node = Node::new(None);
-        node.advertise_service(topic, move |req: StringMsg| {
-            Ok(req)
-        }, None).unwrap();
+        node.advertise_service(topic, move |req: StringMsg| Ok(req), None)
+            .unwrap();
 
         let str_msg = StringMsg {
             data: "HELLO".to_string(),
@@ -412,7 +405,8 @@ mod tests {
         let timeout = Some(Duration::from_secs(1));
         let res = node
             .request::<StringMsg, StringMsg>(topic, request, timeout)
-            .await.unwrap();
+            .await
+            .unwrap();
 
         assert_eq!(res.is_some(), true);
         let string_msg = res.unwrap();
@@ -429,10 +423,15 @@ mod tests {
 
         let topic = "/echo";
         let node = Node::new(None);
-        node.advertise_service(topic, move |req: StringMsg| {
-            bail!("error");
-            Ok(req)
-        }, None).unwrap();
+        node.advertise_service(
+            topic,
+            move |req: StringMsg| {
+                bail!("error");
+                Ok(req)
+            },
+            None,
+        )
+        .unwrap();
 
         let str_msg = StringMsg {
             data: "HELLO".to_string(),
@@ -442,9 +441,9 @@ mod tests {
         let timeout = Some(Duration::from_secs(1));
         let res = node
             .request::<StringMsg, StringMsg>(topic, request, timeout)
-            .await.unwrap();
+            .await
+            .unwrap();
 
         assert_eq!(res.is_some(), false);
     }
-
 }

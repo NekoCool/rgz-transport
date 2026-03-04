@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -24,16 +24,16 @@ where
         let node_uuid = dispatcher.node_uuid().to_string();
         let dispatcher_uuid = dispatcher.uuid().to_string();
 
-        let nodes = self.topics.entry(topic).or_insert(HashMap::new());
-        if let Some(dispatchers) = nodes.get(&node_uuid) {
-            if dispatchers.values().any(|d| d.uuid() == dispatcher.uuid()) {
-                bail!("dispatcher already exists");
-            }
+        let nodes = self.topics.entry(topic).or_default();
+        if let Some(dispatchers) = nodes.get(&node_uuid)
+            && dispatchers.values().any(|d| d.uuid() == dispatcher.uuid())
+        {
+            bail!("dispatcher already exists");
         }
 
         nodes
             .entry(node_uuid)
-            .or_insert(HashMap::new())
+            .or_default()
             .insert(dispatcher_uuid, dispatcher);
 
         Ok(())
@@ -58,7 +58,7 @@ where
             if nodes.is_empty() {
                 self.topics.remove(topic);
             }
-            return dispatchers.map(|d| d.into_iter().map(|(_, d)| d).collect());
+            return dispatchers.map(|d| d.into_values().collect());
         }
         None
     }
@@ -90,13 +90,11 @@ where
     }
 
     pub fn get_for_topic(&mut self, topic: &str) -> Option<Vec<&mut T>> {
-        self.topics.get_mut(topic).and_then(|nodes| {
-            Some(
-                nodes
-                    .values_mut()
-                    .flat_map(|dispatchers| dispatchers.values_mut())
-                    .collect(),
-            )
+        self.topics.get_mut(topic).map(|nodes| {
+            nodes
+                .values_mut()
+                .flat_map(|dispatchers| dispatchers.values_mut())
+                .collect()
         })
     }
 
@@ -106,16 +104,12 @@ where
         request_type: Option<&str>,
         response_type: Option<&str>,
     ) -> Option<Vec<&mut T>> {
-        self.topics.get_mut(topic).and_then(|nodes| {
-            Some(
-                nodes
-                    .iter_mut()
-                    .flat_map(|(_, n)| n.values_mut())
-                    .filter(|d| {
-                        d.request_type() == request_type && d.response_type() == response_type
-                    })
-                    .collect(),
-            )
+        self.topics.get_mut(topic).map(|nodes| {
+            nodes
+                .iter_mut()
+                .flat_map(|(_, n)| n.values_mut())
+                .filter(|d| d.request_type() == request_type && d.response_type() == response_type)
+                .collect()
         })
     }
 
