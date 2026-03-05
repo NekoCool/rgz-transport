@@ -2,6 +2,16 @@
 /// This is a Rust rewrite of lidar_node.c from the following tutorial.
 /// https://gazebosim.org/docs/harmonic/sensors
 ///
+/// Run:
+/// 1. Start Gazebo simulation (Terminal A):
+///    `gz sim sensor_tutorial.sdf`
+/// 2. Run this example (Terminal B):
+///    `cargo run -p rgz-transport --example lidar_node`
+///
+/// Notes:
+/// - The simulation must be in Play state to publish `/lidar`.
+/// - Press Ctrl-C in Terminal B to exit this example.
+///
 use anyhow::Result;
 use rgz_msgs::{LaserScan, Twist, Vector3d};
 use rgz_transport::Node;
