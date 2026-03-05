@@ -58,3 +58,20 @@ Transport examples live under `crates/rgz-transport/examples`.
 cargo run -p rgz-transport --example publisher
 cargo run -p rgz-transport --example subscriber
 ```
+
+## Performance Benchmark (MVP)
+
+`rgz-transport` contains a Criterion benchmark with:
+
+- throughput measurement (`criterion`)
+- latency percentile measurement (`hdrhistogram`, p50/p95/p99)
+- runtime observability (`tracing`, `metrics`)
+
+Run:
+
+```bash
+cargo bench -p rgz-transport --bench transport_perf
+```
+
+The benchmark publishes and subscribes in-process over transport and tests
+message sizes `64`, `1024`, and `8192` bytes.
