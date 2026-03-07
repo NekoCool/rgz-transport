@@ -11,8 +11,18 @@ pub enum TransportError {
     #[error("operation timed out")]
     Timeout,
 
+    #[error("node is busy: queue full on {path}")]
+    NodeBusy {
+        path: &'static str,
+    },
+
     #[error("transport is not running")]
     NotRunning,
+
+    #[error("operation rejected: {detail}")]
+    Rejected {
+        detail: String,
+    },
 
     #[error("transport I/O error: recoverable={recoverable}, detail={detail}")]
     IoError {

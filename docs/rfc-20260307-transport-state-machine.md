@@ -3,10 +3,12 @@
 - RFC ID: `RFC-20260307-001`
 - タイトル: `Transport State Machine & Lifecycle`
 - 作成者: `NekoCool`
-- ステータス: `Review`
+- ステータス: `Accept`
 - 対象crate: `rgz-transport`
 - 関連Issue: `#23`, `#29`
 - 想定リリース: `v0.2.x`
+- 承認日: `2026-03-08`
+- 承認者: `NekoCool`
 
 ## 1. 背景
 
@@ -103,6 +105,22 @@ stateDiagram-v2
 - `Shutdown` は `oneshot` の完了通知（ack）を伴い、handle 側が確実に `ShutdownCompleted` 到達を待てる
 - `Shutdown` 受理後は `Stopping` を目標に、`Publish`/`Subscribe`/`SendRequest` 等の通常コマンドは明示的に拒否またはクリーンアップ経路で終端する
 
+## 7.2 backpressure と queue 方針（実装値）
+
+`crates/rgz-transport` の actor loop は queue ごとに容量と overflow 動作を固定する。
+
+| Queue path | 方向 | 既定容量 | Overflow 動作 |
+| --- | --- | ---: | --- |
+| `command` | API -> actor | `1024` | `TransportError::NodeBusy { path: "command" }` を返す |
+| `control` | API -> actor | `128` | `TransportError::NodeBusy { path: "control" }` を返す |
+| `event` | actor -> API | `2048` | `DropNewest`（既存 queue 内容を維持） |
+| `io_event` | I/O task -> actor | `2048` | `DropNewest`（既存 queue 内容を維持） |
+| `sub_cmd` | actor -> subscriber task | `512` | `try_send` 失敗時に error event を emit する |
+
+補足:
+- `event/io_event` は `try_send` を使い、満杯時に新着イベントを破棄する。
+- shutdown 経路は `control` を優先し、満杯時は即時 `NodeBusy` で確定させる。
+
 ## 8. 実装マッピング（暫定）
 
 - 状態管理: `crates/rgz-transport/src/state.rs`, `crates/rgz-transport/src/api.rs`
@@ -153,8 +171,8 @@ stateDiagram-v2
 - Issue #23 の実装とテストコードをコミット可能な状態にする
 
 ## 10. DoD（Issue #23/#29 完了条件）
-- [ ] 状態遷移仕様を本RFCとして確定
-- [ ] Mermaid図を含む状態定義がレビュー可能
+- [x] 状態遷移仕様を本RFCとして確定
+- [x] Mermaid図を含む状態定義がレビュー可能
 - [ ] `TransportEvent`/`TransportState` と `transition` 実装を追加
 - [ ] 禁止遷移がテストで検証される
 - [ ] `Degraded`/`Failed`/`Stopped` への遷移観測が自動テストで再現される

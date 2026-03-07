@@ -18,6 +18,7 @@ use tokio::time::{sleep, sleep_until, Duration, Instant};
 use crate::config::TransportConfig;
 use crate::error::TransportResult;
 use crate::state::{transition, TransportEvent, TransportState};
+use tracing::warn;
 use zeromq::{
     prelude::*,
     DealerSendHalf, DealerSocket, PubSocket, SubSocket, ZmqMessage,
@@ -29,6 +30,10 @@ pub const DEFAULT_COMMAND_CHANNEL_CAPACITY: usize = 128;
 pub const DEFAULT_EVENT_CHANNEL_CAPACITY: usize = 256;
 /// Default graceful shutdown timeout in milliseconds.
 pub const DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 10_000;
+/// Default capacity for internal I/O event fan-in queue.
+pub const DEFAULT_IO_EVENT_CHANNEL_CAPACITY: usize = 2048;
+/// Default capacity for subscriber control queue.
+pub const DEFAULT_SUB_CMD_CHANNEL_CAPACITY: usize = 512;
 const IO_FRAME_PUBLISH: u8 = 0x01;
 const IO_FRAME_REQUEST: u8 = 0x02;
 const IO_FRAME_REPLY: u8 = 0x03;
@@ -66,6 +71,8 @@ enum SubControlCommand {
 #[derive(Clone, Debug)]
 struct ActorZmqConfig {
     enabled: bool,
+    io_event_capacity: usize,
+    sub_cmd_capacity: usize,
     pub_bind: Option<String>,
     pub_connect: Vec<String>,
     sub_connect: Vec<String>,
@@ -77,6 +84,8 @@ impl ActorZmqConfig {
     fn from_transport_config(config: &TransportConfig) -> Self {
         Self {
             enabled: config.enable_zeromq_io,
+            io_event_capacity: config.io_event_channel_capacity,
+            sub_cmd_capacity: config.sub_cmd_channel_capacity,
             pub_bind: config.zeromq_pub_bind.clone(),
             pub_connect: config.zeromq_pub_connect.clone(),
             sub_connect: config.zeromq_sub_connect.clone(),
@@ -88,9 +97,9 @@ impl ActorZmqConfig {
 
 struct ActorZmqRuntime {
     publisher: Option<PubSocket>,
-    sub_cmd_tx: Option<mpsc::UnboundedSender<SubControlCommand>>,
+    sub_cmd_tx: Option<mpsc::Sender<SubControlCommand>>,
     request_send: Option<DealerSendHalf>,
-    io_event_rx: mpsc::UnboundedReceiver<InternalIoEvent>,
+    io_event_rx: mpsc::Receiver<InternalIoEvent>,
     sub_task: Option<JoinHandle<()>>,
     req_task: Option<JoinHandle<()>>,
 }
@@ -100,7 +109,7 @@ impl ActorZmqRuntime {
         config: &ActorZmqConfig,
     ) -> Result<Self, String> {
         if !config.enabled {
-            let (_, io_event_rx) = mpsc::unbounded_channel();
+            let (_, io_event_rx) = mpsc::channel(1);
             return Ok(Self {
                 publisher: None,
                 sub_cmd_tx: None,
@@ -151,14 +160,14 @@ impl ActorZmqRuntime {
             (Some(send_half), Some(recv_half))
         };
 
-        let (io_event_tx, io_event_rx) = mpsc::unbounded_channel::<InternalIoEvent>();
+        let (io_event_tx, io_event_rx) = mpsc::channel::<InternalIoEvent>(config.io_event_capacity);
         let mut sub_task = None;
         let mut sub_cmd_tx = None;
         let mut req_task = None;
 
         if let Some(mut socket) = subscriber.take() {
             let tx = io_event_tx.clone();
-            let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SubControlCommand>();
+            let (cmd_tx, mut cmd_rx) = mpsc::channel::<SubControlCommand>(config.sub_cmd_capacity);
             sub_cmd_tx = Some(cmd_tx);
             sub_task = Some(tokio::spawn(async move {
                 loop {
@@ -167,7 +176,7 @@ impl ActorZmqRuntime {
                             match cmd {
                                 Some(SubControlCommand::Subscribe(topic)) => {
                                     if let Err(err) = socket.subscribe(&topic).await {
-                                        let _ = tx.send(InternalIoEvent::IoError {
+                                        try_emit_io_event(&tx, InternalIoEvent::IoError {
                                             recoverable: true,
                                             request_id: None,
                                             detail: format!("subscribe failed: {err}"),
@@ -176,7 +185,7 @@ impl ActorZmqRuntime {
                                 }
                                 Some(SubControlCommand::Unsubscribe(topic)) => {
                                     if let Err(err) = socket.unsubscribe(&topic).await {
-                                        let _ = tx.send(InternalIoEvent::IoError {
+                                        try_emit_io_event(&tx, InternalIoEvent::IoError {
                                             recoverable: true,
                                             request_id: None,
                                             detail: format!("unsubscribe failed: {err}"),
@@ -189,11 +198,9 @@ impl ActorZmqRuntime {
                         recv = socket.recv() => {
                             match recv {
                                 Ok(message) => match decode_incoming_message(message) {
-                                    Ok(event) => {
-                                        let _ = tx.send(event);
-                                    }
+                                    Ok(event) => try_emit_io_event(&tx, event),
                                     Err(detail) => {
-                                        let _ = tx.send(InternalIoEvent::IoError {
+                                        try_emit_io_event(&tx, InternalIoEvent::IoError {
                                             recoverable: true,
                                             request_id: None,
                                             detail,
@@ -201,7 +208,7 @@ impl ActorZmqRuntime {
                                     }
                                 },
                                 Err(err) => {
-                                    let _ = tx.send(InternalIoEvent::IoError {
+                                    try_emit_io_event(&tx, InternalIoEvent::IoError {
                                         recoverable: true,
                                         request_id: None,
                                         detail: format!("subscriber recv failed: {err}"),
@@ -221,11 +228,9 @@ impl ActorZmqRuntime {
                 loop {
                     match socket.recv().await {
                         Ok(message) => match decode_incoming_message(message) {
-                            Ok(event) => {
-                                let _ = tx.send(event);
-                            }
+                            Ok(event) => try_emit_io_event(&tx, event),
                             Err(detail) => {
-                                let _ = tx.send(InternalIoEvent::IoError {
+                                try_emit_io_event(&tx, InternalIoEvent::IoError {
                                     recoverable: true,
                                     request_id: None,
                                     detail,
@@ -233,7 +238,7 @@ impl ActorZmqRuntime {
                             }
                         },
                         Err(err) => {
-                            let _ = tx.send(InternalIoEvent::IoError {
+                            try_emit_io_event(&tx, InternalIoEvent::IoError {
                                 recoverable: true,
                                 request_id: None,
                                 detail: format!("request recv failed: {err}"),
@@ -257,7 +262,7 @@ impl ActorZmqRuntime {
 
     async fn stop(&mut self) {
         if let Some(tx) = self.sub_cmd_tx.take() {
-            let _ = tx.send(SubControlCommand::Stop);
+            let _ = tx.try_send(SubControlCommand::Stop);
         }
         if let Some(handle) = self.sub_task.take() {
             handle.abort();
@@ -265,6 +270,26 @@ impl ActorZmqRuntime {
         if let Some(handle) = self.req_task.take() {
             handle.abort();
         }
+    }
+}
+
+fn try_emit_io_event(tx: &mpsc::Sender<InternalIoEvent>, event: InternalIoEvent) {
+    match tx.try_send(event) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            warn!("dropping internal io event due to full queue");
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {}
+    }
+}
+
+fn try_emit_event(tx: &mpsc::Sender<RxEvent>, event: RxEvent) {
+    match tx.try_send(event) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            warn!("dropping actor event due to full queue");
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {}
     }
 }
 
@@ -291,8 +316,9 @@ async fn emit_state_error(
         });
     }
 
-    let _ = event_tx
-        .send(RxEvent::Error {
+    try_emit_event(
+        event_tx,
+        RxEvent::Error {
             request_id,
             status: ReplyStatus::Error,
             detail: if recoverable {
@@ -300,8 +326,8 @@ async fn emit_state_error(
             } else {
                 format!("fatal I/O error: {detail}")
             },
-        })
-        .await;
+        },
+    );
 }
 
 async fn emit_transport_recovery(state: &Arc<Mutex<TransportState>>) {
@@ -752,8 +778,17 @@ pub fn bounded_channels(
     command_capacity: usize,
     event_capacity: usize,
 ) -> ActorChannels {
+    bounded_channels_with_control(command_capacity, command_capacity, event_capacity)
+}
+
+/// Create bounded channels with explicit command/control capacities.
+pub fn bounded_channels_with_control(
+    command_capacity: usize,
+    control_capacity: usize,
+    event_capacity: usize,
+) -> ActorChannels {
     let (command_tx, command_rx) = mpsc::channel(command_capacity);
-    let (control_tx, control_rx) = mpsc::channel(command_capacity);
+    let (control_tx, control_rx) = mpsc::channel(control_capacity);
     let (event_tx, event_rx) = mpsc::channel(event_capacity);
     ActorChannels {
         command_tx,
@@ -812,6 +847,8 @@ impl TransportActor {
                 .await;
                 ActorZmqRuntime::initialize(&ActorZmqConfig {
                     enabled: false,
+                    io_event_capacity: config.io_event_channel_capacity,
+                    sub_cmd_capacity: config.sub_cmd_channel_capacity,
                     pub_bind: None,
                     pub_connect: Vec::new(),
                     sub_connect: Vec::new(),
@@ -847,13 +884,14 @@ impl TransportActor {
                 io_event = io_runtime.io_event_rx.recv(), if io_runtime_active => {
                     match io_event {
                         Some(InternalIoEvent::IncomingPublish { topic, payload }) => {
-                            let _ = event_tx
-                                .send(RxEvent::IncomingPublish {
+                            try_emit_event(
+                                &event_tx,
+                                RxEvent::IncomingPublish {
                                     topic,
                                     payload,
                                     headers: None,
-                                })
-                                .await;
+                                },
+                            );
                             emit_transport_recovery(&state).await;
                         }
                         Some(InternalIoEvent::IncomingRequest {
@@ -863,14 +901,15 @@ impl TransportActor {
                         }) => {
                             let mut inbound = inbound_requests.lock().await;
                             let _ = inbound.insert(request_id);
-                            let _ = event_tx
-                                .send(RxEvent::IncomingRequest {
+                            try_emit_event(
+                                &event_tx,
+                                RxEvent::IncomingRequest {
                                     request_id,
                                     topic,
                                     payload,
                                     headers: None,
-                                })
-                                .await;
+                                },
+                            );
                             emit_transport_recovery(&state).await;
                         }
                         Some(InternalIoEvent::IncomingReply {
@@ -880,23 +919,25 @@ impl TransportActor {
                         }) => {
                             let mut pending = pending_requests.lock().await;
                             if pending.remove(&request_id).is_some() {
-                                let _ = event_tx
-                                    .send(RxEvent::IncomingReply {
+                                try_emit_event(
+                                    &event_tx,
+                                    RxEvent::IncomingReply {
                                         request_id,
                                         payload,
                                         status,
                                         headers: None,
-                                    })
-                                    .await;
+                                    },
+                                );
                                 emit_transport_recovery(&state).await;
                             } else {
-                                let _ = event_tx
-                                    .send(RxEvent::Error {
+                                try_emit_event(
+                                    &event_tx,
+                                    RxEvent::Error {
                                         request_id: Some(request_id),
                                         status: ReplyStatus::Error,
                                         detail: "unexpected reply id".to_string(),
-                                    })
-                                    .await;
+                                    },
+                                );
                             }
                         }
                         Some(InternalIoEvent::IoError {
@@ -923,7 +964,7 @@ impl TransportActor {
                             timeout_ms,
                             ack,
                         }) => {
-                            let _ = event_tx.send(RxEvent::ShutdownRequested).await;
+                            try_emit_event(&event_tx, RxEvent::ShutdownRequested);
                             let mut pending = pending_requests.lock().await;
                             let shutdown_timeout_ms = timeout_ms.unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT_MS);
                             let result = shutdown_wait(
@@ -935,19 +976,20 @@ impl TransportActor {
                                 &event_tx,
                             )
                             .await;
-                            let _ = event_tx.send(RxEvent::ShutdownCompleted).await;
+                            try_emit_event(&event_tx, RxEvent::ShutdownCompleted);
                             let _ = ack.send(result);
                             io_runtime.stop().await;
                             return;
                         }
                         Some(_) => {
-                            let _ = event_tx
-                                .send(RxEvent::Error {
+                            try_emit_event(
+                                &event_tx,
+                                RxEvent::Error {
                                     request_id: None,
                                     status: ReplyStatus::Rejected,
                                     detail: "non-shutdown command sent on control channel".to_string(),
-                                })
-                                .await;
+                                },
+                            );
                         }
                         None => {
                             control_open = false;
@@ -999,13 +1041,14 @@ impl TransportActor {
                                 continue;
                             }
                             if io_runtime.publisher.is_none() {
-                                let _ = event_tx
-                                    .send(RxEvent::IncomingPublish {
+                                try_emit_event(
+                                    &event_tx,
+                                    RxEvent::IncomingPublish {
                                         topic,
                                         payload,
                                         headers,
-                                    })
-                                    .await;
+                                    },
+                                );
                             }
                         }
                         Some(TxCmd::SendRequest { request }) => {
@@ -1023,13 +1066,14 @@ impl TransportActor {
                                     sleep(Duration::from_millis(timeout_ms)).await;
                                     let mut pending = pending_requests.lock().await;
                                     if pending.remove(&request_id).is_some() {
-                                        let _ = timeout_tx
-                                            .send(RxEvent::Error {
+                                        try_emit_event(
+                                            &timeout_tx,
+                                            RxEvent::Error {
                                                 request_id: Some(request_id),
                                                 status: ReplyStatus::Timeout,
                                                 detail: "request timed out".to_string(),
-                                            })
-                                            .await;
+                                            },
+                                        );
                                     }
                                 });
                             }
@@ -1047,13 +1091,14 @@ impl TransportActor {
                                             Err(err) => {
                                                 let mut pending = pending_requests.lock().await;
                                                 pending.remove(&request_id);
-                                                let _ = event_tx
-                                                    .send(RxEvent::Error {
+                                                try_emit_event(
+                                                    &event_tx,
+                                                    RxEvent::Error {
                                                         request_id: Some(request_id),
                                                         status: ReplyStatus::Error,
                                                         detail: format!("request send failed: {err}"),
-                                                    })
-                                                    .await;
+                                                    },
+                                                );
                                                 emit_state_error(
                                                     &state,
                                                     &event_tx,
@@ -1068,13 +1113,14 @@ impl TransportActor {
                                     Err(err) => {
                                         let mut pending = pending_requests.lock().await;
                                         pending.remove(&request_id);
-                                        let _ = event_tx
-                                            .send(RxEvent::Error {
+                                        try_emit_event(
+                                            &event_tx,
+                                            RxEvent::Error {
                                                 request_id: Some(request_id),
                                                 status: ReplyStatus::Error,
                                                 detail: err.to_string(),
-                                            })
-                                            .await;
+                                            },
+                                        );
                                         emit_state_error(
                                             &state,
                                             &event_tx,
@@ -1093,14 +1139,15 @@ impl TransportActor {
                                 continue;
                             }
                             if io_runtime.request_send.is_none() {
-                                let _ = event_tx
-                                    .send(RxEvent::IncomingRequest {
+                                try_emit_event(
+                                    &event_tx,
+                                    RxEvent::IncomingRequest {
                                         request_id,
                                         topic: request.topic,
                                         payload: request.payload,
                                         headers: request.headers,
-                                    })
-                                    .await;
+                                    },
+                                );
                             }
                         }
                         Some(TxCmd::SendReply { reply }) => {
@@ -1124,24 +1171,26 @@ impl TransportActor {
                                                 Ok(_) => {
                                                     emit_transport_recovery(&state).await;
                                                     if is_outbound {
-                                                        let _ = event_tx
-                                                            .send(RxEvent::IncomingReply {
+                                                        try_emit_event(
+                                                            &event_tx,
+                                                            RxEvent::IncomingReply {
                                                                 request_id: reply.request_id,
                                                                 payload: reply.payload,
                                                                 status: reply.status,
                                                                 headers: reply.headers,
-                                                            })
-                                                            .await;
+                                                            },
+                                                        );
                                                     }
                                                 }
                                                 Err(err) => {
-                                                    let _ = event_tx
-                                                        .send(RxEvent::Error {
+                                                    try_emit_event(
+                                                        &event_tx,
+                                                        RxEvent::Error {
                                                             request_id: Some(reply.request_id),
                                                             status: ReplyStatus::Error,
                                                             detail: format!("reply send failed: {err}"),
-                                                        })
-                                                        .await;
+                                                        },
+                                                    );
                                                     emit_state_error(
                                                         &state,
                                                         &event_tx,
@@ -1153,23 +1202,25 @@ impl TransportActor {
                                                 }
                                             }
                                         } else {
-                                            let _ = event_tx
-                                                .send(RxEvent::Error {
+                                            try_emit_event(
+                                                &event_tx,
+                                                RxEvent::Error {
                                                     request_id: Some(reply.request_id),
                                                     status: ReplyStatus::Error,
                                                     detail: "unexpected reply id".to_string(),
-                                                })
-                                                .await;
+                                                },
+                                            );
                                         }
                                     }
                                     Err(err) => {
-                                        let _ = event_tx
-                                            .send(RxEvent::Error {
+                                        try_emit_event(
+                                            &event_tx,
+                                            RxEvent::Error {
                                                 request_id: Some(reply.request_id),
                                                 status: ReplyStatus::Error,
                                                 detail: err.to_string(),
-                                            })
-                                            .await;
+                                            },
+                                        );
                                         emit_state_error(
                                             &state,
                                             &event_tx,
@@ -1184,35 +1235,38 @@ impl TransportActor {
                                 let mut pending = pending_requests.lock().await;
                                 pending.remove(&reply.request_id).is_some()
                             } {
-                                let _ = event_tx
-                                    .send(RxEvent::IncomingReply {
+                                try_emit_event(
+                                    &event_tx,
+                                    RxEvent::IncomingReply {
                                         request_id: reply.request_id,
                                         payload: reply.payload,
                                         status: reply.status,
                                         headers: reply.headers,
-                                    })
-                                    .await;
+                                    },
+                                );
                                 emit_transport_recovery(&state).await;
                             } else {
-                                let _ = event_tx
-                                    .send(RxEvent::Error {
+                                try_emit_event(
+                                    &event_tx,
+                                    RxEvent::Error {
                                         request_id: Some(reply.request_id),
                                         status: ReplyStatus::Error,
                                         detail: "unexpected reply id".to_string(),
-                                    })
-                                    .await;
+                                    },
+                                );
                             }
                         }
                         Some(TxCmd::Subscribe { topic }) => {
                             if let Some(sub_cmd_tx) = io_runtime.sub_cmd_tx.as_ref() {
-                                if let Err(err) = sub_cmd_tx.send(SubControlCommand::Subscribe(topic.clone())) {
-                                    let _ = event_tx
-                                        .send(RxEvent::Error {
+                                if let Err(err) = sub_cmd_tx.try_send(SubControlCommand::Subscribe(topic.clone())) {
+                                    try_emit_event(
+                                        &event_tx,
+                                        RxEvent::Error {
                                             request_id: None,
                                             status: ReplyStatus::Error,
                                             detail: format!("subscribe command failed: {err}"),
-                                        })
-                                        .await;
+                                        },
+                                    );
                                     emit_state_error(
                                         &state,
                                         &event_tx,
@@ -1223,22 +1277,23 @@ impl TransportActor {
                                     .await;
                                 } else {
                                     emit_transport_recovery(&state).await;
-                                    let _ = event_tx.send(RxEvent::Subscribed { topic }).await;
+                                    try_emit_event(&event_tx, RxEvent::Subscribed { topic });
                                 }
                             } else {
-                                let _ = event_tx.send(RxEvent::Subscribed { topic }).await;
+                                try_emit_event(&event_tx, RxEvent::Subscribed { topic });
                             }
                         }
                         Some(TxCmd::Unsubscribe { topic }) => {
                             if let Some(sub_cmd_tx) = io_runtime.sub_cmd_tx.as_ref() {
-                                if let Err(err) = sub_cmd_tx.send(SubControlCommand::Unsubscribe(topic.clone())) {
-                                    let _ = event_tx
-                                        .send(RxEvent::Error {
+                                if let Err(err) = sub_cmd_tx.try_send(SubControlCommand::Unsubscribe(topic.clone())) {
+                                    try_emit_event(
+                                        &event_tx,
+                                        RxEvent::Error {
                                             request_id: None,
                                             status: ReplyStatus::Error,
                                             detail: format!("unsubscribe command failed: {err}"),
-                                        })
-                                        .await;
+                                        },
+                                    );
                                     emit_state_error(
                                         &state,
                                         &event_tx,
@@ -1249,32 +1304,34 @@ impl TransportActor {
                                     .await;
                                 } else {
                                     emit_transport_recovery(&state).await;
-                                    let _ = event_tx.send(RxEvent::Unsubscribed { topic }).await;
+                                    try_emit_event(&event_tx, RxEvent::Unsubscribed { topic });
                                 }
                             } else {
-                                let _ = event_tx.send(RxEvent::Unsubscribed { topic }).await;
+                                try_emit_event(&event_tx, RxEvent::Unsubscribed { topic });
                             }
                         }
                         Some(TxCmd::Connect { endpoint, namespace: _ }) => {
-                            let _ = event_tx.send(RxEvent::Connected { endpoint }).await;
+                            try_emit_event(&event_tx, RxEvent::Connected { endpoint });
                             emit_transport_recovery(&state).await;
                         }
                         Some(TxCmd::Disconnect { endpoint, reason }) => {
-                            let _ = event_tx
-                                .send(RxEvent::Disconnected {
+                            try_emit_event(
+                                &event_tx,
+                                RxEvent::Disconnected {
                                     endpoint,
                                     reason,
-                                })
-                                .await;
+                                },
+                            );
                         }
                         Some(TxCmd::Shutdown { .. }) => {
-                            let _ = event_tx
-                                .send(RxEvent::Error {
+                            try_emit_event(
+                                &event_tx,
+                                RxEvent::Error {
                                     request_id: None,
                                     status: ReplyStatus::Rejected,
                                     detail: "shutdown command sent on normal channel".to_string(),
-                                })
-                                .await;
+                                },
+                            );
                         }
                         None => {
                             command_open = false;
@@ -1299,13 +1356,14 @@ async fn shutdown_wait(
 ) -> TransportResult<()> {
     if !graceful {
         for request_id in pending_requests.drain().map(|(request_id, _)| request_id) {
-            let _ = event_tx
-                .send(RxEvent::Error {
+            try_emit_event(
+                event_tx,
+                RxEvent::Error {
                     request_id: Some(request_id),
                     status: ReplyStatus::Error,
                     detail: "actor shutting down".to_string(),
-                })
-                .await;
+                },
+            );
         }
         return Ok(());
     }
@@ -1324,13 +1382,14 @@ async fn shutdown_wait(
                         let _ = ack.send(Ok(()));
                     }
                     Some(_) => {
-                        let _ = event_tx
-                            .send(RxEvent::Error {
+                        try_emit_event(
+                            event_tx,
+                            RxEvent::Error {
                                 request_id: None,
                                 status: ReplyStatus::Rejected,
                                 detail: "command rejected during graceful shutdown".to_string(),
-                            })
-                            .await;
+                            },
+                        );
                     }
                     None => {}
                 }
@@ -1339,45 +1398,49 @@ async fn shutdown_wait(
                 match cmd {
                     Some(TxCmd::SendReply { reply }) => {
                         if pending_requests.remove(&reply.request_id).is_some() {
-                            let _ = event_tx
-                                .send(RxEvent::IncomingReply {
+                            try_emit_event(
+                                event_tx,
+                                RxEvent::IncomingReply {
                                     request_id: reply.request_id,
                                     payload: reply.payload,
                                     headers: reply.headers,
                                     status: reply.status,
-                                })
-                                .await;
+                                },
+                            );
                         } else {
-                            let _ = event_tx
-                                .send(RxEvent::Error {
+                            try_emit_event(
+                                event_tx,
+                                RxEvent::Error {
                                     request_id: Some(reply.request_id),
                                     status: ReplyStatus::Error,
                                     detail: "unexpected reply id".to_string(),
-                                })
-                                .await;
+                                },
+                            );
                         }
                     }
                     Some(_) => {
-                        let _ = event_tx
-                            .send(RxEvent::Error {
+                        try_emit_event(
+                            event_tx,
+                            RxEvent::Error {
                                 request_id: None,
                                 status: ReplyStatus::Rejected,
                                 detail: "command rejected during graceful shutdown".to_string(),
-                            })
-                            .await;
+                            },
+                        );
                     }
                     None => return Ok(()),
                 }
             }
             _ = sleep_until(deadline) => {
                 for (request_id, _) in pending_requests.drain() {
-                    let _ = event_tx
-                        .send(RxEvent::Error {
+                    try_emit_event(
+                        event_tx,
+                        RxEvent::Error {
                             request_id: Some(request_id),
                             status: ReplyStatus::Timeout,
                             detail: "request timed out during shutdown".to_string(),
-                        })
-                        .await;
+                        },
+                    );
                 }
                 return Ok(());
             }
@@ -1391,7 +1454,6 @@ mod tests {
     #[cfg(feature = "network-tests")]
     use std::sync::atomic::{AtomicU16, Ordering as AtomicOrdering};
     use tokio::sync::Mutex as TokioMutex;
-    #[cfg(feature = "network-tests")]
     use tokio::time::timeout;
 
     #[cfg(feature = "network-tests")]
@@ -1578,6 +1640,90 @@ mod tests {
             }) => assert!(detail.contains("fatal I/O error: hard-fail")),
             _ => panic!("expected fatal io error"),
         }
+    }
+
+    #[tokio::test]
+    async fn recoverable_error_then_recovery_returns_to_running_state() {
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let state = Arc::new(TokioMutex::new(TransportState::Running));
+
+        emit_state_error(&state, &event_tx, true, None, "temporary").await;
+        assert_eq!(*state.lock().await, TransportState::Degraded);
+
+        emit_transport_recovery(&state).await;
+        assert_eq!(*state.lock().await, TransportState::Running);
+    }
+
+    #[tokio::test]
+    async fn event_queue_overflow_drops_newest_event() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        event_tx
+            .try_send(RxEvent::Connected {
+                endpoint: "inproc://first".to_string(),
+            })
+            .expect("fill event queue");
+
+        try_emit_event(
+            &event_tx,
+            RxEvent::Connected {
+                endpoint: "inproc://dropped".to_string(),
+            },
+        );
+
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(RxEvent::Connected { endpoint }) if endpoint == "inproc://first"
+        ));
+        assert!(matches!(
+            timeout(Duration::from_millis(20), event_rx.recv()).await,
+            Err(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn io_event_queue_overflow_drops_newest_event() {
+        let (io_tx, mut io_rx) = mpsc::channel(1);
+        io_tx
+            .try_send(InternalIoEvent::IncomingPublish {
+                topic: "telemetry/first".to_string(),
+                payload: vec![1],
+            })
+            .expect("fill io event queue");
+
+        try_emit_io_event(
+            &io_tx,
+            InternalIoEvent::IncomingPublish {
+                topic: "telemetry/dropped".to_string(),
+                payload: vec![2],
+            },
+        );
+
+        assert!(matches!(
+            io_rx.recv().await,
+            Some(InternalIoEvent::IncomingPublish { topic, payload })
+                if topic == "telemetry/first" && payload == vec![1]
+        ));
+        assert!(matches!(
+            timeout(Duration::from_millis(20), io_rx.recv()).await,
+            Err(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn sub_command_queue_reports_full_when_saturated() {
+        let (sub_tx, _sub_rx) = mpsc::channel(1);
+        sub_tx
+            .try_send(SubControlCommand::Subscribe("topic/first".to_string()))
+            .expect("fill sub command queue");
+
+        let err = sub_tx
+            .try_send(SubControlCommand::Unsubscribe("topic/second".to_string()))
+            .expect_err("second command should hit full queue");
+        assert!(matches!(
+            err,
+            mpsc::error::TrySendError::Full(SubControlCommand::Unsubscribe(topic))
+                if topic == "topic/second"
+        ));
     }
 
     #[tokio::test]

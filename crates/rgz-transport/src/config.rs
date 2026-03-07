@@ -8,6 +8,16 @@ pub struct TransportConfig {
     pub node_name: String,
     /// Optional default timeout for startup/shutdown operations in milliseconds.
     pub timeout_ms: u64,
+    /// Capacity for standard command ingress queue.
+    pub command_channel_capacity: usize,
+    /// Capacity for control/shutdown ingress queue.
+    pub control_channel_capacity: usize,
+    /// Capacity for outbound actor event queue.
+    pub event_channel_capacity: usize,
+    /// Capacity for internal I/O event queue.
+    pub io_event_channel_capacity: usize,
+    /// Capacity for subscriber control queue.
+    pub sub_cmd_channel_capacity: usize,
     /// Enable async ZeroMQ transport I/O wiring in the actor loop.
     pub enable_zeromq_io: bool,
     /// Optional local PUB socket bind endpoint (for publish path).
@@ -27,6 +37,11 @@ impl Default for TransportConfig {
         Self {
             node_name: "rgz-node".to_string(),
             timeout_ms: 1_000,
+            command_channel_capacity: 1024,
+            control_channel_capacity: 128,
+            event_channel_capacity: 2048,
+            io_event_channel_capacity: 2048,
+            sub_cmd_channel_capacity: 512,
             enable_zeromq_io: false,
             zeromq_pub_bind: None,
             zeromq_pub_connect: Vec::new(),

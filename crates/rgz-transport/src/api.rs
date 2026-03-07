@@ -1,6 +1,6 @@
 use crate::actor::{
-    bounded_channels, ReplyStatus, TxCmd, TxRequest, TxReply, DEFAULT_COMMAND_CHANNEL_CAPACITY,
-    DEFAULT_EVENT_CHANNEL_CAPACITY, DEFAULT_SHUTDOWN_TIMEOUT_MS, RxEvent, RequestId,
+    bounded_channels_with_control, ReplyStatus, TxCmd, TxRequest, TxReply,
+    DEFAULT_SHUTDOWN_TIMEOUT_MS, RxEvent, RequestId,
     RequestIdGenerator,
 };
 use crate::actor::TransportActor;
@@ -10,6 +10,7 @@ use crate::state::{TransportEvent, TransportState, transition};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::{timeout, Duration};
 
 /// Main transport entrypoint for v2.
@@ -66,9 +67,10 @@ impl Transport {
             *state = started;
         }
 
-        let actor_channels = bounded_channels(
-            DEFAULT_COMMAND_CHANNEL_CAPACITY,
-            DEFAULT_EVENT_CHANNEL_CAPACITY,
+        let actor_channels = bounded_channels_with_control(
+            self.config.command_channel_capacity,
+            self.config.control_channel_capacity,
+            self.config.event_channel_capacity,
         );
         let actor_tx = actor_channels.event_tx.clone();
         let actor_task = tokio::spawn(TransportActor::run_with_channels_with_config(
@@ -109,13 +111,29 @@ impl TransportHandle {
         self.request_id_gen.next()
     }
 
-    pub async fn send_cmd(&self, cmd: TxCmd) {
+    fn try_send_command(&self, cmd: TxCmd) -> TransportResult<()> {
+        match self.command_tx.try_send(cmd) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(TransportError::NodeBusy { path: "command" }),
+            Err(TrySendError::Closed(_)) => Err(TransportError::NotRunning),
+        }
+    }
+
+    fn try_send_control(&self, cmd: TxCmd) -> TransportResult<()> {
+        match self.control_tx.try_send(cmd) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(TransportError::NodeBusy { path: "control" }),
+            Err(TrySendError::Closed(_)) => Err(TransportError::NotRunning),
+        }
+    }
+
+    pub async fn send_cmd(&self, cmd: TxCmd) -> TransportResult<()> {
         match cmd {
             TxCmd::Shutdown { .. } => {
-                let _ = self.control_tx.send(cmd).await;
+                self.try_send_control(cmd)
             }
             _ => {
-                let _ = self.command_tx.send(cmd).await;
+                self.try_send_command(cmd)
             }
         }
     }
@@ -125,15 +143,12 @@ impl TransportHandle {
         topic: impl Into<String>,
         payload: Vec<u8>,
         headers: Option<crate::actor::MessageHeaders>,
-    ) {
-        let _ = self
-            .command_tx
-            .send(TxCmd::Publish {
-                topic: topic.into(),
-                payload,
-                headers,
-            })
-            .await;
+    ) -> TransportResult<()> {
+        self.try_send_command(TxCmd::Publish {
+            topic: topic.into(),
+            payload,
+            headers,
+        })
     }
 
     pub async fn request(
@@ -142,7 +157,7 @@ impl TransportHandle {
         payload: Vec<u8>,
         headers: Option<crate::actor::MessageHeaders>,
         timeout_ms: Option<u64>,
-    ) -> TxRequest {
+    ) -> TransportResult<TxRequest> {
         let request_id = self.request_id_gen.next();
         let request = TxRequest {
             request_id,
@@ -151,73 +166,69 @@ impl TransportHandle {
             headers,
             timeout_ms,
         };
-        let _ = self
-            .command_tx
-            .send(TxCmd::SendRequest {
-                request: request.clone(),
-            })
-            .await;
-        request
+        self.try_send_command(TxCmd::SendRequest {
+            request: request.clone(),
+        })?;
+        Ok(request)
     }
 
-    pub async fn reply(&self, request_id: RequestId, payload: Vec<u8>, status: ReplyStatus) {
-        let _ = self
-            .command_tx
-            .send(TxCmd::SendReply {
-                reply: TxReply {
-                    request_id,
-                    payload,
-                    status,
-                    headers: None,
-                },
-            })
-            .await;
+    pub async fn reply(
+        &self,
+        request_id: RequestId,
+        payload: Vec<u8>,
+        status: ReplyStatus,
+    ) -> TransportResult<()> {
+        self.try_send_command(TxCmd::SendReply {
+            reply: TxReply {
+                request_id,
+                payload,
+                status,
+                headers: None,
+            },
+        })
     }
 
-    pub async fn subscribe(&self, topic: impl Into<String>) {
-        let _ = self
-            .command_tx
-            .send(TxCmd::Subscribe { topic: topic.into() })
-            .await;
+    pub async fn subscribe(&self, topic: impl Into<String>) -> TransportResult<()> {
+        self.try_send_command(TxCmd::Subscribe { topic: topic.into() })
     }
 
-    pub async fn unsubscribe(&self, topic: impl Into<String>) {
-        let _ = self
-            .command_tx
-            .send(TxCmd::Unsubscribe { topic: topic.into() })
-            .await;
+    pub async fn unsubscribe(&self, topic: impl Into<String>) -> TransportResult<()> {
+        self.try_send_command(TxCmd::Unsubscribe { topic: topic.into() })
     }
 
-    pub async fn connect(&self, endpoint: impl Into<String>, namespace: Option<String>) {
-        let _ = self
-            .command_tx
-            .send(TxCmd::Connect {
-                endpoint: endpoint.into(),
-                namespace,
-            })
-            .await;
+    pub async fn connect(
+        &self,
+        endpoint: impl Into<String>,
+        namespace: Option<String>,
+    ) -> TransportResult<()> {
+        self.try_send_command(TxCmd::Connect {
+            endpoint: endpoint.into(),
+            namespace,
+        })
     }
 
-    pub async fn disconnect(&self, endpoint: impl Into<String>, reason: Option<String>) {
-        let _ = self
-            .command_tx
-            .send(TxCmd::Disconnect {
-                endpoint: endpoint.into(),
-                reason,
-            })
-            .await;
+    pub async fn disconnect(
+        &self,
+        endpoint: impl Into<String>,
+        reason: Option<String>,
+    ) -> TransportResult<()> {
+        self.try_send_command(TxCmd::Disconnect {
+            endpoint: endpoint.into(),
+            reason,
+        })
     }
 
-    pub async fn shutdown_cmd(&self, graceful: bool, timeout_ms: Option<u64>) {
+    pub async fn shutdown_cmd(
+        &self,
+        graceful: bool,
+        timeout_ms: Option<u64>,
+    ) -> TransportResult<()> {
         let (ack_tx, _ack_rx) = oneshot::channel();
-        let _ = self
-            .control_tx
-            .send(TxCmd::Shutdown {
-                graceful,
-                timeout_ms,
-                ack: ack_tx,
-            })
-            .await;
+        self.try_send_control(TxCmd::Shutdown {
+            graceful,
+            timeout_ms,
+            ack: ack_tx,
+        })
     }
 
     pub async fn next_event(&self) -> Option<RxEvent> {
@@ -253,15 +264,11 @@ impl TransportHandle {
         };
 
         let (ack_tx, ack_rx) = oneshot::channel();
-        self
-            .control_tx
-            .send(TxCmd::Shutdown {
-                graceful,
-                timeout_ms: Some(timeout_ms),
-                ack: ack_tx,
-            })
-            .await
-            .map_err(|_| TransportError::NotRunning)?;
+        self.try_send_control(TxCmd::Shutdown {
+            graceful,
+            timeout_ms: Some(timeout_ms),
+            ack: ack_tx,
+        })?;
 
         {
             let mut state = self.state.lock().await;
@@ -349,5 +356,60 @@ mod tests {
         assert!(matches!(second, Ok(()) | Err(TransportError::InvalidTransition { .. }) | Err(TransportError::NotRunning)));
 
         assert_eq!(handle.state().await, TransportState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn publish_returns_node_busy_when_command_queue_is_full() {
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        command_tx
+            .try_send(TxCmd::Publish {
+                topic: "topic/full".to_string(),
+                payload: vec![1],
+                headers: None,
+            })
+            .expect("fill command queue");
+        let (control_tx, _control_rx) = mpsc::channel(1);
+        let (_event_tx, event_rx) = mpsc::channel(1);
+
+        let handle = TransportHandle {
+            state: Arc::new(Mutex::new(TransportState::Running)),
+            config: TransportConfig::default(),
+            command_tx,
+            control_tx,
+            event_rx: Arc::new(Mutex::new(event_rx)),
+            request_id_gen: RequestIdGenerator::new(),
+            actor_task: tokio::spawn(async {}),
+        };
+
+        let result = handle.publish("topic/full", vec![2], None).await;
+        assert!(matches!(result, Err(TransportError::NodeBusy { path: "command" })));
+    }
+
+    #[tokio::test]
+    async fn shutdown_cmd_returns_node_busy_when_control_queue_is_full() {
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let (control_tx, _control_rx) = mpsc::channel(1);
+        let (_event_tx, event_rx) = mpsc::channel(1);
+        let (ack_tx, _ack_rx) = oneshot::channel();
+        control_tx
+            .try_send(TxCmd::Shutdown {
+                graceful: true,
+                timeout_ms: Some(10),
+                ack: ack_tx,
+            })
+            .expect("fill control queue");
+
+        let handle = TransportHandle {
+            state: Arc::new(Mutex::new(TransportState::Running)),
+            config: TransportConfig::default(),
+            command_tx,
+            control_tx,
+            event_rx: Arc::new(Mutex::new(event_rx)),
+            request_id_gen: RequestIdGenerator::new(),
+            actor_task: tokio::spawn(async {}),
+        };
+
+        let result = handle.shutdown_cmd(true, Some(10)).await;
+        assert!(matches!(result, Err(TransportError::NodeBusy { path: "control" })));
     }
 }

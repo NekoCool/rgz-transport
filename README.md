@@ -50,6 +50,43 @@ Run network integration tests (ignored by default):
 cargo test -p rgz-transport --lib --features network-tests -- --ignored --test-threads=1
 ```
 
+## API error handling
+
+`rgz-transport` exposes explicit backpressure/error signaling.
+`TransportHandle` methods below return `Result` and should be handled by callers:
+
+- `send_cmd`
+- `publish`
+- `request`
+- `reply`
+- `subscribe`
+- `unsubscribe`
+- `connect`
+- `disconnect`
+- `shutdown_cmd`
+
+Default channel policy:
+
+| Queue path | Default capacity | Overflow behavior |
+| --- | ---: | --- |
+| `command` | `1024` | `Err(TransportError::NodeBusy { path: "command" })` |
+| `control` | `128` | `Err(TransportError::NodeBusy { path: "control" })` |
+| `event` | `2048` | `DropNewest` (existing queued events are preserved) |
+| `io_event` | `2048` | `DropNewest` (existing queued events are preserved) |
+| `sub_cmd` | `512` | error event (`subscribe/unsubscribe command failed`) |
+
+Backpressure handling example:
+
+```rust
+match handle.publish("topic/a", payload, None).await {
+    Ok(()) => {}
+    Err(rgz_transport::TransportError::NodeBusy { .. }) => {
+        // retry with backoff/jitter
+    }
+    Err(err) => return Err(err),
+}
+```
+
 ## Examples
 
 Transport examples live under `crates/rgz-transport/examples`.
