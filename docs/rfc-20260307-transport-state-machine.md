@@ -3,10 +3,12 @@
 - RFC ID: `RFC-20260307-001`
 - タイトル: `Transport State Machine & Lifecycle`
 - 作成者: `NekoCool`
-- ステータス: `Review`
+- ステータス: `Accepted`
 - 対象crate: `rgz-transport`
 - 関連Issue: `#23`
 - 想定リリース: `v0.2.x`
+- 承認日: `2026-03-08`
+- 承認者: `NekoCool`
 
 ## 1. 背景
 
@@ -143,8 +145,8 @@ stateDiagram-v2
 - Issue #23 の実装とテストコードをコミット可能な状態にする
 
 ## 10. DoD（Issue #23 完了条件）
-- [ ] 状態遷移仕様を本RFCとして確定
-- [ ] Mermaid図を含む状態定義がレビュー可能
+- [x] 状態遷移仕様を本RFCとして確定
+- [x] Mermaid図を含む状態定義がレビュー可能
 - [ ] `TransportEvent`/`TransportState` と `transition` 実装を追加
 - [ ] 禁止遷移がテストで検証される
 - [ ] `Degraded`/`Failed`/`Stopped` への遷移観測が自動テストで再現される
