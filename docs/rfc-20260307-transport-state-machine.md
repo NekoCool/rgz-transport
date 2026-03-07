@@ -3,7 +3,7 @@
 - RFC ID: `RFC-20260307-001`
 - タイトル: `Transport State Machine & Lifecycle`
 - 作成者: `NekoCool`
-- ステータス: `Accept`
+- ステータス: `Accepted`
 - 対象crate: `rgz-transport`
 - 関連Issue: `#23`, `#29`
 - 想定リリース: `v0.2.x`
