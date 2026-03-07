@@ -1,8 +1,8 @@
 use crate::config::TransportConfig;
 use crate::error::{TransportError, TransportResult};
-use crate::state::{transition, TransportEvent, TransportState};
-use tokio::sync::Mutex;
+use crate::state::{TransportEvent, TransportState, transition};
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 /// Main transport entrypoint for v2.
 pub struct Transport {
@@ -27,11 +27,12 @@ impl Transport {
     pub async fn start(self) -> TransportResult<TransportHandle> {
         let next = {
             let state = self.state.lock().await;
-            transition(*state, TransportEvent::InitRequested)
-                .map_err(|_| TransportError::InvalidTransition {
+            transition(*state, TransportEvent::InitRequested).map_err(|_| {
+                TransportError::InvalidTransition {
                     from: *state,
                     event: TransportEvent::InitRequested,
-                })?
+                }
+            })?
         };
 
         {

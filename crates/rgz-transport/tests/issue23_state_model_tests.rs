@@ -1,4 +1,6 @@
-use rgz_transport::{state, state::StateModel, TransportError, TransportEvent, TransportState, transition};
+use rgz_transport::{
+    TransportError, TransportEvent, TransportState, state, state::StateModel, transition,
+};
 
 #[test]
 fn issue23_invalid_transition_is_rejected() {
@@ -140,7 +142,10 @@ fn issue23_transition_matrix_forbidden_transitions() {
 
     for (from, event) in forbidden {
         assert!(
-            matches!(transition(from, event), Err(TransportError::InvalidTransition { .. })),
+            matches!(
+                transition(from, event),
+                Err(TransportError::InvalidTransition { .. })
+            ),
             "{from:?} -> {event:?} should be forbidden"
         );
     }
@@ -158,9 +163,15 @@ fn issue23_state_model_rejects_forbidden_transitions_without_mutating_state() {
         model.state = state;
         let before = model;
         assert!(
-            matches!(model.apply(event, 1234), Err(TransportError::InvalidTransition { .. })),
+            matches!(
+                model.apply(event, 1234),
+                Err(TransportError::InvalidTransition { .. })
+            ),
             "{state:?} -> {event:?} should be invalid"
         );
-        assert_eq!(model, before, "{state:?} -> {event:?} should not mutate state");
+        assert_eq!(
+            model, before,
+            "{state:?} -> {event:?} should not mutate state"
+        );
     }
 }

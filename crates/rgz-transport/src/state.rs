@@ -129,7 +129,9 @@ impl StateModel {
                 }
             }
             (Degraded, FatalError) => Failed,
-            (Running, ShutdownRequested) | (Degraded, ShutdownRequested) | (Failed, ShutdownRequested) => {
+            (Running, ShutdownRequested)
+            | (Degraded, ShutdownRequested)
+            | (Failed, ShutdownRequested) => {
                 self.recoverable_error_count = 0;
                 self.recoverable_first_ms = None;
                 self.retry_success_count = 0;
@@ -246,8 +248,8 @@ pub fn transition(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_events, event_priority, StateModel, TimedEvent, TransportError, TransportEvent::*,
-        TransportState::*, RecoveryPolicy,
+        RecoveryPolicy, StateModel, TimedEvent, TransportError, TransportEvent::*,
+        TransportState::*, apply_events, event_priority,
     };
 
     #[test]
@@ -255,13 +257,31 @@ mod tests {
         assert_eq!(super::transition(Created, InitRequested).unwrap(), Starting);
         assert_eq!(super::transition(Starting, StartOk).unwrap(), Running);
         assert_eq!(super::transition(Starting, StartErr).unwrap(), Stopped);
-        assert_eq!(super::transition(Running, RecoverableError).unwrap(), Degraded);
+        assert_eq!(
+            super::transition(Running, RecoverableError).unwrap(),
+            Degraded
+        );
         assert_eq!(super::transition(Running, FatalError).unwrap(), Failed);
-        assert_eq!(super::transition(Running, ShutdownRequested).unwrap(), Stopping);
-        assert_eq!(super::transition(Degraded, RetrySucceeded).unwrap(), Running);
-        assert_eq!(super::transition(Degraded, ShutdownRequested).unwrap(), Stopping);
-        assert_eq!(super::transition(Failed, ShutdownRequested).unwrap(), Stopping);
-        assert_eq!(super::transition(Stopping, ShutdownComplete).unwrap(), Stopped);
+        assert_eq!(
+            super::transition(Running, ShutdownRequested).unwrap(),
+            Stopping
+        );
+        assert_eq!(
+            super::transition(Degraded, RetrySucceeded).unwrap(),
+            Running
+        );
+        assert_eq!(
+            super::transition(Degraded, ShutdownRequested).unwrap(),
+            Stopping
+        );
+        assert_eq!(
+            super::transition(Failed, ShutdownRequested).unwrap(),
+            Stopping
+        );
+        assert_eq!(
+            super::transition(Stopping, ShutdownComplete).unwrap(),
+            Stopped
+        );
     }
 
     #[test]
