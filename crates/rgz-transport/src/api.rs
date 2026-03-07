@@ -8,6 +8,7 @@ use crate::config::TransportConfig;
 use crate::error::{TransportError, TransportResult};
 use crate::state::{TransportEvent, TransportState, transition};
 use std::sync::Arc;
+use tokio::sync::oneshot;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::{timeout, Duration};
 
@@ -22,8 +23,10 @@ pub struct TransportHandle {
     state: Arc<Mutex<TransportState>>,
     config: TransportConfig,
     command_tx: mpsc::Sender<TxCmd>,
+    control_tx: mpsc::Sender<TxCmd>,
     event_rx: Arc<Mutex<mpsc::Receiver<RxEvent>>>,
     request_id_gen: RequestIdGenerator,
+    actor_task: tokio::task::JoinHandle<()>,
 }
 
 impl Transport {
@@ -68,8 +71,9 @@ impl Transport {
             DEFAULT_EVENT_CHANNEL_CAPACITY,
         );
         let actor_tx = actor_channels.event_tx.clone();
-        tokio::spawn(TransportActor::run_with_channels(
+        let actor_task = tokio::spawn(TransportActor::run_with_channels(
             actor_channels.command_rx,
+            actor_channels.control_rx,
             actor_tx,
         ));
 
@@ -77,8 +81,10 @@ impl Transport {
             state: Arc::clone(&self.state),
             config: self.config,
             command_tx: actor_channels.command_tx,
+            control_tx: actor_channels.control_tx,
             event_rx: Arc::new(Mutex::new(actor_channels.event_rx)),
             request_id_gen: RequestIdGenerator::new(),
+            actor_task,
         })
     }
 }
@@ -93,12 +99,23 @@ impl TransportHandle {
         self.command_tx.clone()
     }
 
+    pub fn control_sender(&self) -> mpsc::Sender<TxCmd> {
+        self.control_tx.clone()
+    }
+
     pub fn next_request_id(&self) -> RequestId {
         self.request_id_gen.next()
     }
 
     pub async fn send_cmd(&self, cmd: TxCmd) {
-        let _ = self.command_tx.send(cmd).await;
+        match cmd {
+            TxCmd::Shutdown { .. } => {
+                let _ = self.control_tx.send(cmd).await;
+            }
+            _ => {
+                let _ = self.command_tx.send(cmd).await;
+            }
+        }
     }
 
     pub async fn publish(
@@ -190,11 +207,13 @@ impl TransportHandle {
     }
 
     pub async fn shutdown_cmd(&self, graceful: bool, timeout_ms: Option<u64>) {
+        let (ack_tx, _ack_rx) = oneshot::channel();
         let _ = self
-            .command_tx
+            .control_tx
             .send(TxCmd::Shutdown {
                 graceful,
                 timeout_ms,
+                ack: ack_tx,
             })
             .await;
     }
@@ -221,6 +240,7 @@ impl TransportHandle {
         graceful: bool,
         timeout_ms: Option<u64>,
     ) -> TransportResult<()> {
+        let timeout_ms = timeout_ms.unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT_MS);
         let next_state = {
             let state = self.state.lock().await;
             if *state == TransportState::Stopped {
@@ -230,11 +250,13 @@ impl TransportHandle {
             transition(*state, TransportEvent::ShutdownRequested)?
         };
 
+        let (ack_tx, ack_rx) = oneshot::channel();
         self
-            .command_tx
+            .control_tx
             .send(TxCmd::Shutdown {
                 graceful,
-                timeout_ms,
+                timeout_ms: Some(timeout_ms),
+                ack: ack_tx,
             })
             .await
             .map_err(|_| TransportError::NotRunning)?;
@@ -244,7 +266,7 @@ impl TransportHandle {
             *state = next_state;
         }
 
-        self.wait_for_shutdown_complete(timeout_ms.unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT_MS))
+        self.wait_for_shutdown_complete(timeout_ms, ack_rx)
             .await?;
 
         {
@@ -260,26 +282,22 @@ impl TransportHandle {
         self.shutdown_with(true, None).await
     }
 
-    async fn wait_for_shutdown_complete(&self, timeout_ms: u64) -> TransportResult<()> {
-        let mut event_rx = self.event_rx.lock().await;
-        let wait_res = timeout(
-            Duration::from_millis(timeout_ms),
-            async {
-                while let Some(event) = event_rx.recv().await {
-                    match event {
-                        RxEvent::ShutdownCompleted => return Ok(()),
-                        _ => continue,
-                    }
-                }
-
-                Err(TransportError::NotRunning)
-            },
-        )
-        .await;
+    async fn wait_for_shutdown_complete(
+        &self,
+        timeout_ms: u64,
+        ack_rx: oneshot::Receiver<TransportResult<()>>,
+    ) -> TransportResult<()> {
+        let wait_res = timeout(Duration::from_millis(timeout_ms), ack_rx).await;
 
         match wait_res {
-            Ok(result) => result,
-            Err(_) => Err(TransportError::Timeout),
+            Ok(result) => result.map_err(|_| TransportError::NotRunning)?,
+            Err(_) => {
+                self.actor_task.abort();
+                let mut state = self.state.lock().await;
+                let next = transition(*state, TransportEvent::ShutdownComplete)?;
+                *state = next;
+                Err(TransportError::Timeout)
+            }
         }
     }
 }
@@ -312,5 +330,22 @@ mod tests {
 
         let second = handle.shutdown().await;
         assert!(matches!(second, Err(TransportError::NotRunning)));
+    }
+
+    #[tokio::test]
+    async fn transport_concurrent_shutdown_requests_are_single_completion() {
+        let transport = Transport::new(TransportConfig::default());
+        let handle = transport.start().await.expect("start transport");
+
+        let f1 = handle.shutdown_with(true, Some(200));
+        let f2 = handle.shutdown_with(true, Some(200));
+        let (first, second) = tokio::join!(f1, f2);
+
+        let ok_count = usize::from(first.is_ok()) + usize::from(second.is_ok());
+        assert_eq!(ok_count, 1);
+        assert!(matches!(first, Ok(()) | Err(TransportError::InvalidTransition { .. }) | Err(TransportError::NotRunning)));
+        assert!(matches!(second, Ok(()) | Err(TransportError::InvalidTransition { .. }) | Err(TransportError::NotRunning)));
+
+        assert_eq!(handle.state().await, TransportState::Stopped);
     }
 }

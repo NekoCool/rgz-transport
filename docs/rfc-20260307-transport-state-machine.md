@@ -5,7 +5,7 @@
 - 作成者: `NekoCool`
 - ステータス: `Review`
 - 対象crate: `rgz-transport`
-- 関連Issue: `#23`
+- 関連Issue: `#23`, `#29`
 - 想定リリース: `v0.2.x`
 
 ## 1. 背景
@@ -89,15 +89,24 @@ stateDiagram-v2
 
 - すべての状態更新は `transition(current_state, event) -> (next_state, effects)` の単一関数で行う
 - 複数イベント同時到着時はイベント処理順を固定（`ShutdownRequested` を最優先）
+- actor 受信レベルでも `Shutdown` の処理を優先する  
+  - 停止要求は通常コマンドより高優先で受付し、停止要求受付後は停止シーケンスへ移る
+  - actor 側の通常コマンド処理は、停止遷移完了まで `Rejected` または timeout/error 経路で確定させる
 - `Degraded` は `recoverable_error_count` と `last_recovered_at` を保有
   - `recoverable_error_count >= 3` かつ `5秒以内に再試行継続` で `Failed` に遷移
   - `RetrySucceeded` を連続N回受理（初期値: 3回）で `Running` に復帰
 - `Failed` は必ず `ShutdownRequested` で `Stopping` へ遷移（外部依存のリソース解放を確定）
 
+## 7.1 actor 受信優先順位（実装追加）
+
+- actor は `TxCmd` を通常コマンド(channels: `command_tx/control_tx`) と `Shutdown` 制御チャネルに分離して受け取り、`Shutdown` を受信優先(`tokio::select!` の `biased` 優先分岐)で処理する
+- `Shutdown` は `oneshot` の完了通知（ack）を伴い、handle 側が確実に `ShutdownCompleted` 到達を待てる
+- `Shutdown` 受理後は `Stopping` を目標に、`Publish`/`Subscribe`/`SendRequest` 等の通常コマンドは明示的に拒否またはクリーンアップ経路で終端する
+
 ## 8. 実装マッピング（暫定）
 
-- 状態管理: `crates/rgz-transport/src/transport.rs`（または `transport/state.rs` を新設）
-- イベント生成: transport 内部イベントループ
+- 状態管理: `crates/rgz-transport/src/state.rs`, `crates/rgz-transport/src/api.rs`
+- イベント生成・受信優先制御: `crates/rgz-transport/src/actor.rs`
 - 監視: `tracing` + メトリクス
 
 ## 9. テスト計画
@@ -121,7 +130,8 @@ stateDiagram-v2
   3. 送受信フロー中の recoverable error 注入シナリオ: `Running -> Degraded`
   4. 致命エラーシナリオ: `Running -> Failed -> Stopping -> Stopped`
   5. 終了優先順位シナリオ: `ShutdownRequested` が他イベントより優先される
-- 検証: 5シナリオでクラッシュなし、最終状態が期待どおり。
+  6. actor 受信優先順位シナリオ: `Shutdown` が同時投入された通常コマンドより先に処理される
+- 検証: 6シナリオでクラッシュなし、最終状態が期待どおり。
 
 ### 9.3 ログ/監視
 - 最低限の監視ログを確認
@@ -138,11 +148,11 @@ stateDiagram-v2
 
 ### 9.5 テスト完了条件（DoD）
 - 上記の単体テストが PASS
-- 上記5統合シナリオが PASS
+- 上記6統合シナリオが PASS
 - 禁止遷移テストが PASS
 - Issue #23 の実装とテストコードをコミット可能な状態にする
 
-## 10. DoD（Issue #23 完了条件）
+## 10. DoD（Issue #23/#29 完了条件）
 - [ ] 状態遷移仕様を本RFCとして確定
 - [ ] Mermaid図を含む状態定義がレビュー可能
 - [ ] `TransportEvent`/`TransportState` と `transition` 実装を追加

@@ -11,6 +11,9 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, sleep_until, Duration, Instant};
+use tokio::sync::oneshot;
+
+use crate::error::TransportResult;
 
 /// Default capacity for the inbound command channel.
 pub const DEFAULT_COMMAND_CHANNEL_CAPACITY: usize = 128;
@@ -72,7 +75,7 @@ pub struct TxReply {
 }
 
 /// Commands sent into the actor loop (inbound stream).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum TxCmd {
     /// Publish a message to one or more subscribers.
     Publish {
@@ -132,6 +135,8 @@ pub enum TxCmd {
         /// Optional graceful shutdown timeout in milliseconds.
         /// Applies only when graceful is true. None uses `DEFAULT_SHUTDOWN_TIMEOUT_MS`.
         timeout_ms: Option<u64>,
+        /// Acknowledgement channel for shutdown completion.
+        ack: oneshot::Sender<TransportResult<()>>,
     },
 }
 
@@ -220,6 +225,10 @@ pub struct ActorChannels {
     pub command_tx: mpsc::Sender<TxCmd>,
     /// Inbound command receiver (actor side).
     pub command_rx: mpsc::Receiver<TxCmd>,
+    /// Inbound control sender (shutdown).
+    pub control_tx: mpsc::Sender<TxCmd>,
+    /// Inbound control receiver (actor side).
+    pub control_rx: mpsc::Receiver<TxCmd>,
     /// Outbound event sender (actor -> external).
     pub event_tx: mpsc::Sender<RxEvent>,
     /// Outbound event receiver (external side).
@@ -257,10 +266,13 @@ pub fn bounded_channels(
     event_capacity: usize,
 ) -> ActorChannels {
     let (command_tx, command_rx) = mpsc::channel(command_capacity);
+    let (control_tx, control_rx) = mpsc::channel(command_capacity);
     let (event_tx, event_rx) = mpsc::channel(event_capacity);
     ActorChannels {
         command_tx,
         command_rx,
+        control_tx,
+        control_rx,
         event_tx,
         event_rx,
     }
@@ -276,118 +288,170 @@ impl Default for ActorChannels {
 pub struct TransportActor;
 
 impl TransportActor {
-    /// Starts the actor loop (placeholder for v2 bootstrapping).
-    pub async fn run() {
-        // Intentionally empty in the bootstrap phase.
-    }
-
     /// Placeholder event loop that receives bounded inbound commands and emits outbound events.
     /// The loop currently acts as a smoke-safe sink for command/event plumbing.
     pub async fn run_with_channels(
+        command_rx: mpsc::Receiver<TxCmd>,
+        control_rx: mpsc::Receiver<TxCmd>,
+        event_tx: mpsc::Sender<RxEvent>,
+    ) {
+        Self::run_loop(command_rx, control_rx, event_tx).await;
+    }
+
+    /// Core actor entrypoint.
+    pub async fn run_loop(
         mut command_rx: mpsc::Receiver<TxCmd>,
+        mut control_rx: mpsc::Receiver<TxCmd>,
         event_tx: mpsc::Sender<RxEvent>,
     ) {
         let pending_requests: Arc<Mutex<HashMap<RequestId, Option<u64>>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let mut command_open = true;
+        let mut control_open = true;
 
-        while let Some(cmd) = command_rx.recv().await {
-            match cmd {
-                TxCmd::Publish {
-                    topic,
-                    payload,
-                    headers,
-                } => {
-                    let _ = event_tx
-                        .send(RxEvent::IncomingPublish {
+        while command_open || control_open {
+            tokio::select! {
+                biased;
+                cmd = control_rx.recv(), if control_open => {
+                    match cmd {
+                        Some(TxCmd::Shutdown {
+                            graceful,
+                            timeout_ms,
+                            ack,
+                        }) => {
+                            let _ = event_tx.send(RxEvent::ShutdownRequested).await;
+                            let mut pending = pending_requests.lock().await;
+                            let shutdown_timeout_ms = timeout_ms.unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT_MS);
+                            let result = shutdown_wait(
+                                graceful,
+                                shutdown_timeout_ms,
+                                &mut command_rx,
+                                &mut control_rx,
+                                &mut pending,
+                                &event_tx,
+                            )
+                            .await;
+                            let _ = event_tx.send(RxEvent::ShutdownCompleted).await;
+                            let _ = ack.send(result);
+                            return;
+                        }
+                        Some(_) => {
+                            let _ = event_tx
+                                .send(RxEvent::Error {
+                                    request_id: None,
+                                    status: ReplyStatus::Rejected,
+                                    detail: "non-shutdown command sent on control channel".to_string(),
+                                })
+                                .await;
+                        }
+                        None => {
+                            control_open = false;
+                        }
+                    }
+                }
+                cmd = command_rx.recv(), if command_open => {
+                    match cmd {
+                        Some(TxCmd::Publish {
                             topic,
                             payload,
                             headers,
-                        })
-                        .await;
-                }
-                TxCmd::SendRequest { request } => {
-                    let timeout_ms = request.timeout_ms;
-                    let request_id = request.request_id;
-                    {
-                        let mut pending = pending_requests.lock().await;
-                        let _ = pending.insert(request_id, timeout_ms);
-                    }
+                        }) => {
+                            let _ = event_tx
+                                .send(RxEvent::IncomingPublish {
+                                    topic,
+                                    payload,
+                                    headers,
+                                })
+                                .await;
+                        }
+                        Some(TxCmd::SendRequest { request }) => {
+                            let timeout_ms = request.timeout_ms;
+                            let request_id = request.request_id;
+                            {
+                                let mut pending = pending_requests.lock().await;
+                                let _ = pending.insert(request_id, timeout_ms);
+                            }
 
-                    if let Some(timeout_ms) = timeout_ms {
-                        let pending_requests = Arc::clone(&pending_requests);
-                        let timeout_tx = event_tx.clone();
-                        tokio::spawn(async move {
-                            sleep(Duration::from_millis(timeout_ms)).await;
+                            if let Some(timeout_ms) = timeout_ms {
+                                let pending_requests = Arc::clone(&pending_requests);
+                                let timeout_tx = event_tx.clone();
+                                tokio::spawn(async move {
+                                    sleep(Duration::from_millis(timeout_ms)).await;
+                                    let mut pending = pending_requests.lock().await;
+                                    if pending.remove(&request_id).is_some() {
+                                        let _ = timeout_tx
+                                            .send(RxEvent::Error {
+                                                request_id: Some(request_id),
+                                                status: ReplyStatus::Timeout,
+                                                detail: "request timed out".to_string(),
+                                            })
+                                            .await;
+                                    }
+                                });
+                            }
+
+                            let _ = event_tx
+                                .send(RxEvent::IncomingRequest {
+                                    request_id,
+                                    topic: request.topic,
+                                    payload: request.payload,
+                                    headers: request.headers,
+                                })
+                                .await;
+                        }
+                        Some(TxCmd::SendReply { reply }) => {
                             let mut pending = pending_requests.lock().await;
-                            if pending.remove(&request_id).is_some() {
-                                let _ = timeout_tx
+                            if pending.remove(&reply.request_id).is_some() {
+                                let _ = event_tx
+                                    .send(RxEvent::IncomingReply {
+                                        request_id: reply.request_id,
+                                        payload: reply.payload,
+                                        headers: reply.headers,
+                                        status: reply.status,
+                                    })
+                                    .await;
+                            } else {
+                                let _ = event_tx
                                     .send(RxEvent::Error {
-                                        request_id: Some(request_id),
-                                        status: ReplyStatus::Timeout,
-                                        detail: "request timed out".to_string(),
+                                        request_id: Some(reply.request_id),
+                                        status: ReplyStatus::Error,
+                                        detail: "unexpected reply id".to_string(),
                                     })
                                     .await;
                             }
-                        });
+                        }
+                        Some(TxCmd::Subscribe { topic }) => {
+                            let _ = event_tx.send(RxEvent::Subscribed { topic }).await;
+                        }
+                        Some(TxCmd::Unsubscribe { topic }) => {
+                            let _ = event_tx.send(RxEvent::Unsubscribed { topic }).await;
+                        }
+                        Some(TxCmd::Connect { endpoint, .. }) => {
+                            let _ = event_tx.send(RxEvent::Connected { endpoint }).await;
+                        }
+                        Some(TxCmd::Disconnect { endpoint, reason }) => {
+                            let _ = event_tx
+                                .send(RxEvent::Disconnected {
+                                    endpoint,
+                                    reason,
+                                })
+                                .await;
+                        }
+                        Some(TxCmd::Shutdown { .. }) => {
+                            let _ = event_tx
+                                .send(RxEvent::Error {
+                                    request_id: None,
+                                    status: ReplyStatus::Rejected,
+                                    detail: "shutdown command sent on normal channel".to_string(),
+                                })
+                                .await;
+                        }
+                        None => {
+                            command_open = false;
+                        }
                     }
-
-                    let _ = event_tx
-                        .send(RxEvent::IncomingRequest {
-                            request_id,
-                            topic: request.topic,
-                            payload: request.payload,
-                            headers: request.headers,
-                        })
-                        .await;
                 }
-                TxCmd::SendReply { reply } => {
-                    let mut pending = pending_requests.lock().await;
-                    if pending.remove(&reply.request_id).is_some() {
-                        let _ = event_tx
-                            .send(RxEvent::IncomingReply {
-                                request_id: reply.request_id,
-                                payload: reply.payload,
-                                headers: reply.headers,
-                                status: reply.status,
-                            })
-                            .await;
-                    } else {
-                        let _ = event_tx
-                            .send(RxEvent::Error {
-                                request_id: Some(reply.request_id),
-                                status: ReplyStatus::Error,
-                                detail: "unexpected reply id".to_string(),
-                            })
-                            .await;
-                    }
-                }
-                TxCmd::Subscribe { topic } => {
-                    let _ = event_tx.send(RxEvent::Subscribed { topic }).await;
-                }
-                TxCmd::Unsubscribe { topic } => {
-                    let _ = event_tx.send(RxEvent::Unsubscribed { topic }).await;
-                }
-                TxCmd::Connect { endpoint, .. } => {
-                    let _ = event_tx.send(RxEvent::Connected { endpoint }).await;
-                }
-                TxCmd::Disconnect { endpoint, reason } => {
-                    let _ = event_tx.send(RxEvent::Disconnected { endpoint, reason }).await;
-                }
-                TxCmd::Shutdown {
-                    graceful,
-                    timeout_ms,
-                } => {
-                    let _ = event_tx.send(RxEvent::ShutdownRequested).await;
-                    let mut pending = pending_requests.lock().await;
-                    shutdown_wait(
-                        graceful,
-                        timeout_ms.unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT_MS),
-                        &mut command_rx,
-                        &mut pending,
-                        &event_tx,
-                    )
-                    .await;
-                    let _ = event_tx.send(RxEvent::ShutdownCompleted).await;
+                else => {
                     break;
                 }
             }
@@ -399,9 +463,10 @@ async fn shutdown_wait(
     graceful: bool,
     timeout_ms: u64,
     command_rx: &mut mpsc::Receiver<TxCmd>,
+    control_rx: &mut mpsc::Receiver<TxCmd>,
     pending_requests: &mut HashMap<RequestId, Option<u64>>,
     event_tx: &mpsc::Sender<RxEvent>,
-) {
+) -> TransportResult<()> {
     if !graceful {
         for request_id in pending_requests.drain().map(|(request_id, _)| request_id) {
             let _ = event_tx
@@ -412,16 +477,34 @@ async fn shutdown_wait(
                 })
                 .await;
         }
-        return;
+        return Ok(());
     }
 
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     loop {
         if pending_requests.is_empty() {
-            return;
+            return Ok(());
         }
 
         tokio::select! {
+            biased;
+            cmd = control_rx.recv() => {
+                match cmd {
+                    Some(TxCmd::Shutdown { ack, .. }) => {
+                        let _ = ack.send(Ok(()));
+                    }
+                    Some(_) => {
+                        let _ = event_tx
+                            .send(RxEvent::Error {
+                                request_id: None,
+                                status: ReplyStatus::Rejected,
+                                detail: "command rejected during graceful shutdown".to_string(),
+                            })
+                            .await;
+                    }
+                    None => {}
+                }
+            }
             cmd = command_rx.recv() => {
                 match cmd {
                     Some(TxCmd::SendReply { reply }) => {
@@ -453,7 +536,7 @@ async fn shutdown_wait(
                             })
                             .await;
                     }
-                    None => return,
+                    None => return Ok(()),
                 }
             }
             _ = sleep_until(deadline) => {
@@ -466,7 +549,7 @@ async fn shutdown_wait(
                         })
                         .await;
                 }
-                return;
+                return Ok(());
             }
         }
     }
@@ -478,6 +561,7 @@ mod tests {
 
     struct TestActorChannels {
         command_tx: mpsc::Sender<TxCmd>,
+        control_tx: mpsc::Sender<TxCmd>,
         event_rx: mpsc::Receiver<RxEvent>,
     }
 
@@ -485,13 +569,16 @@ mod tests {
         let ActorChannels {
             command_tx,
             command_rx,
+            control_tx,
+            control_rx,
             event_tx,
             event_rx,
         } = channels;
         let actor_tx = event_tx.clone();
-        tokio::spawn(TransportActor::run_with_channels(command_rx, actor_tx));
+        tokio::spawn(TransportActor::run_with_channels(command_rx, control_rx, actor_tx));
         TestActorChannels {
             command_tx,
+            control_tx,
             event_rx,
         }
     }
@@ -689,11 +776,19 @@ mod tests {
                 },
             })
             .await;
+        assert!(matches!(
+            actor_channels.event_rx.recv().await,
+            Some(RxEvent::IncomingRequest { request_id: 21, .. })
+        ));
         let _ = actor_channels
-            .command_tx
+            .control_tx
             .send(TxCmd::Shutdown {
                 graceful: true,
                 timeout_ms: Some(200),
+                ack: {
+                    let (ack_tx, _) = tokio::sync::oneshot::channel();
+                    ack_tx
+                },
             })
             .await;
         let _ = actor_channels
@@ -708,10 +803,6 @@ mod tests {
             })
             .await;
 
-        assert!(matches!(
-            actor_channels.event_rx.recv().await,
-            Some(RxEvent::IncomingRequest { request_id: 21, .. })
-        ));
         assert!(matches!(
             actor_channels.event_rx.recv().await,
             Some(RxEvent::ShutdownRequested)
@@ -747,18 +838,22 @@ mod tests {
                 },
             })
             .await;
-        let _ = actor_channels
-            .command_tx
-            .send(TxCmd::Shutdown {
-                graceful: false,
-                timeout_ms: None,
-            })
-            .await;
-
         assert!(matches!(
             actor_channels.event_rx.recv().await,
             Some(RxEvent::IncomingRequest { request_id: 31, .. })
         ));
+        let _ = actor_channels
+            .control_tx
+            .send(TxCmd::Shutdown {
+                graceful: false,
+                timeout_ms: None,
+                ack: {
+                    let (ack_tx, _) = tokio::sync::oneshot::channel();
+                    ack_tx
+                },
+            })
+            .await;
+
         assert!(matches!(
             actor_channels.event_rx.recv().await,
             Some(RxEvent::ShutdownRequested)
@@ -794,11 +889,19 @@ mod tests {
                 },
             })
             .await;
+        assert!(matches!(
+            actor_channels.event_rx.recv().await,
+            Some(RxEvent::IncomingRequest { request_id: 41, .. })
+        ));
         let _ = actor_channels
-            .command_tx
+            .control_tx
             .send(TxCmd::Shutdown {
                 graceful: true,
                 timeout_ms: Some(200),
+                ack: {
+                    let (ack_tx, _) = tokio::sync::oneshot::channel();
+                    ack_tx
+                },
             })
             .await;
         let _ = actor_channels
@@ -810,10 +913,6 @@ mod tests {
             })
             .await;
 
-        assert!(matches!(
-            actor_channels.event_rx.recv().await,
-            Some(RxEvent::IncomingRequest { request_id: 41, .. })
-        ));
         assert!(matches!(
             actor_channels.event_rx.recv().await,
             Some(RxEvent::ShutdownRequested)
@@ -833,16 +932,83 @@ mod tests {
         let mut actor_channels = spawn_core(bounded_channels(16, 16)).await;
 
         let _ = actor_channels
-            .command_tx
+            .control_tx
             .send(TxCmd::Shutdown {
                 graceful: true,
                 timeout_ms: None,
+                ack: {
+                    let (ack_tx, _) = tokio::sync::oneshot::channel();
+                    ack_tx
+                },
             })
             .await;
 
         assert!(matches!(
             actor_channels.event_rx.recv().await,
             Some(RxEvent::ShutdownRequested)
+        ));
+        assert!(matches!(
+            actor_channels.event_rx.recv().await,
+            Some(RxEvent::ShutdownCompleted)
+        ));
+    }
+
+    #[tokio::test]
+    async fn actor_prioritizes_control_shutdown_over_normal_commands() {
+        let mut actor_channels = spawn_core(bounded_channels(16, 16)).await;
+
+        let _ = actor_channels
+            .command_tx
+            .send(TxCmd::Publish {
+                topic: "topic/priority".to_string(),
+                payload: b"late".to_vec(),
+                headers: None,
+            })
+            .await;
+        let _ = actor_channels
+            .control_tx
+            .send(TxCmd::Shutdown {
+                graceful: false,
+                timeout_ms: None,
+                ack: {
+                    let (ack_tx, _) = tokio::sync::oneshot::channel();
+                    ack_tx
+                },
+            })
+            .await;
+
+        assert!(matches!(
+            actor_channels.event_rx.recv().await,
+            Some(RxEvent::ShutdownRequested)
+        ));
+        assert!(matches!(
+            actor_channels.event_rx.recv().await,
+            Some(RxEvent::ShutdownCompleted)
+        ));
+        assert!(matches!(actor_channels.event_rx.recv().await, None));
+    }
+
+    #[tokio::test]
+    async fn actor_shutdown_returns_acknowledgement() {
+        let mut actor_channels = spawn_core(bounded_channels(16, 16)).await;
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+        let _ = actor_channels
+            .control_tx
+            .send(TxCmd::Shutdown {
+                graceful: true,
+                timeout_ms: None,
+                ack: ack_tx,
+            })
+            .await;
+
+        assert!(matches!(
+            actor_channels.event_rx.recv().await,
+            Some(RxEvent::ShutdownRequested)
+        ));
+        assert!(matches!(
+            ack_rx.await,
+            Ok(Ok(()))
         ));
         assert!(matches!(
             actor_channels.event_rx.recv().await,
