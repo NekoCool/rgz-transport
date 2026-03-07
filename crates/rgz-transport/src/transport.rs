@@ -9,3 +9,9 @@ impl TransportRuntime {
         Self
     }
 }
+
+impl Default for TransportRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}

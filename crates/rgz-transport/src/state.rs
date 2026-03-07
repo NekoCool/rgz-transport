@@ -367,7 +367,7 @@ mod tests {
 
     #[test]
     fn event_priority_places_shutdown_first() {
-        let mut list = vec![
+        let mut list = [
             TimedEvent::new(10, RetrySucceeded),
             TimedEvent::new(10, ShutdownRequested),
             TimedEvent::new(10, RecoverableError),
