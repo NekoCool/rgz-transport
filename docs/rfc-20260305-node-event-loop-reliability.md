@@ -5,8 +5,8 @@
 - 作成者: `codex`
 - ステータス: `Review`
 - 対象crate: `rgz-transport`
-- 関連Issue/PR: `TBD`
-- 想定リリース: `v0.x (次期マイナー)`
+- 関連Issue/PR: [RFC-20260305-001: Implement Node Event Loop Reliability roadmap #14](https://github.com/NekoCool/rgz-transport/issues/14)
+- 想定リリース: `v0.2`
 
 ## 1. 背景
 
