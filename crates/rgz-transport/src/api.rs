@@ -24,9 +24,9 @@ impl Transport {
         }
     }
 
-    pub async fn start(mut self) -> TransportResult<TransportHandle> {
+    pub async fn start(self) -> TransportResult<TransportHandle> {
         let next = {
-            let mut state = self.state.lock().await;
+            let state = self.state.lock().await;
             transition(*state, TransportEvent::InitRequested)
                 .map_err(|_| TransportError::InvalidTransition {
                     from: *state,
