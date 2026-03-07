@@ -3,7 +3,7 @@
 - RFC ID: `RFC-20260305-001`
 - タイトル: `NodeShared/Transporter の状態遷移明確化・チャネル容量設計・失敗戻り値の構造化`
 - 作成者: `codex`
-- ステータス: `Review`
+- ステータス: `Superseded`
 - 対象crate: `rgz-transport`
 - 関連Issue/PR: [RFC-20260305-001: Implement Node Event Loop Reliability roadmap #14](https://github.com/NekoCool/rgz-transport/issues/14)
 - 想定リリース: `v0.2`
