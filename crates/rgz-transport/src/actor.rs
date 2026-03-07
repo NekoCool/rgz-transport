@@ -5,15 +5,23 @@
 //! mapped in the adapter layer instead.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::convert::TryInto;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio::sync::Mutex;
-use tokio::time::{sleep, sleep_until, Duration, Instant};
 use tokio::sync::oneshot;
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
+use tokio::time::{sleep, sleep_until, Duration, Instant};
 
+use crate::config::TransportConfig;
 use crate::error::TransportResult;
+use crate::state::{transition, TransportEvent, TransportState};
+use zeromq::{
+    prelude::*,
+    DealerSendHalf, DealerSocket, PubSocket, SubSocket, ZmqMessage,
+};
 
 /// Default capacity for the inbound command channel.
 pub const DEFAULT_COMMAND_CHANNEL_CAPACITY: usize = 128;
@@ -21,6 +29,485 @@ pub const DEFAULT_COMMAND_CHANNEL_CAPACITY: usize = 128;
 pub const DEFAULT_EVENT_CHANNEL_CAPACITY: usize = 256;
 /// Default graceful shutdown timeout in milliseconds.
 pub const DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 10_000;
+const IO_FRAME_PUBLISH: u8 = 0x01;
+const IO_FRAME_REQUEST: u8 = 0x02;
+const IO_FRAME_REPLY: u8 = 0x03;
+
+#[derive(Debug)]
+enum InternalIoEvent {
+    IncomingPublish {
+        topic: String,
+        payload: MessagePayload,
+    },
+    IncomingRequest {
+        request_id: RequestId,
+        topic: String,
+        payload: MessagePayload,
+    },
+    IncomingReply {
+        request_id: RequestId,
+        status: ReplyStatus,
+        payload: MessagePayload,
+    },
+    IoError {
+        recoverable: bool,
+        detail: String,
+        request_id: Option<RequestId>,
+    },
+}
+
+#[derive(Debug)]
+enum SubControlCommand {
+    Subscribe(String),
+    Unsubscribe(String),
+    Stop,
+}
+
+#[derive(Clone, Debug)]
+struct ActorZmqConfig {
+    enabled: bool,
+    pub_bind: Option<String>,
+    pub_connect: Vec<String>,
+    sub_connect: Vec<String>,
+    req_bind: Option<String>,
+    req_connect: Vec<String>,
+}
+
+impl ActorZmqConfig {
+    fn from_transport_config(config: &TransportConfig) -> Self {
+        Self {
+            enabled: config.enable_zeromq_io,
+            pub_bind: config.zeromq_pub_bind.clone(),
+            pub_connect: config.zeromq_pub_connect.clone(),
+            sub_connect: config.zeromq_sub_connect.clone(),
+            req_bind: config.zeromq_req_bind.clone(),
+            req_connect: config.zeromq_req_connect.clone(),
+        }
+    }
+}
+
+struct ActorZmqRuntime {
+    publisher: Option<PubSocket>,
+    sub_cmd_tx: Option<mpsc::UnboundedSender<SubControlCommand>>,
+    request_send: Option<DealerSendHalf>,
+    io_event_rx: mpsc::UnboundedReceiver<InternalIoEvent>,
+    sub_task: Option<JoinHandle<()>>,
+    req_task: Option<JoinHandle<()>>,
+}
+
+impl ActorZmqRuntime {
+    async fn initialize(
+        config: &ActorZmqConfig,
+    ) -> Result<Self, String> {
+        if !config.enabled {
+            let (_, io_event_rx) = mpsc::unbounded_channel();
+            return Ok(Self {
+                publisher: None,
+                sub_cmd_tx: None,
+                request_send: None,
+                io_event_rx,
+                sub_task: None,
+                req_task: None,
+            });
+        }
+
+        let mut publisher = if config.pub_bind.is_none() && config.pub_connect.is_empty() {
+            None
+        } else {
+            Some(PubSocket::new())
+        };
+
+        if let Some(socket) = publisher.as_mut() {
+            if let Some(endpoint) = &config.pub_bind {
+                socket.bind(endpoint).await.map_err(|err| err.to_string())?;
+            }
+            for endpoint in &config.pub_connect {
+                socket.connect(endpoint).await.map_err(|err| err.to_string())?;
+            }
+        }
+
+        let mut subscriber = if config.sub_connect.is_empty() {
+            None
+        } else {
+            Some(SubSocket::new())
+        };
+        if let Some(socket) = subscriber.as_mut() {
+            for endpoint in &config.sub_connect {
+                socket.connect(endpoint).await.map_err(|err| err.to_string())?;
+            }
+        }
+
+        let (request_send, mut request_recv) = if config.req_bind.is_none() && config.req_connect.is_empty() {
+            (None, None)
+        } else {
+            let mut socket = DealerSocket::new();
+            if let Some(endpoint) = &config.req_bind {
+                socket.bind(endpoint).await.map_err(|err| err.to_string())?;
+            }
+            for endpoint in &config.req_connect {
+                socket.connect(endpoint).await.map_err(|err| err.to_string())?;
+            }
+            let (send_half, recv_half) = socket.split();
+            (Some(send_half), Some(recv_half))
+        };
+
+        let (io_event_tx, io_event_rx) = mpsc::unbounded_channel::<InternalIoEvent>();
+        let mut sub_task = None;
+        let mut sub_cmd_tx = None;
+        let mut req_task = None;
+
+        if let Some(mut socket) = subscriber.take() {
+            let tx = io_event_tx.clone();
+            let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SubControlCommand>();
+            sub_cmd_tx = Some(cmd_tx);
+            sub_task = Some(tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        cmd = cmd_rx.recv() => {
+                            match cmd {
+                                Some(SubControlCommand::Subscribe(topic)) => {
+                                    if let Err(err) = socket.subscribe(&topic).await {
+                                        let _ = tx.send(InternalIoEvent::IoError {
+                                            recoverable: true,
+                                            request_id: None,
+                                            detail: format!("subscribe failed: {err}"),
+                                        });
+                                    }
+                                }
+                                Some(SubControlCommand::Unsubscribe(topic)) => {
+                                    if let Err(err) = socket.unsubscribe(&topic).await {
+                                        let _ = tx.send(InternalIoEvent::IoError {
+                                            recoverable: true,
+                                            request_id: None,
+                                            detail: format!("unsubscribe failed: {err}"),
+                                        });
+                                    }
+                                }
+                                Some(SubControlCommand::Stop) | None => break,
+                            }
+                        }
+                        recv = socket.recv() => {
+                            match recv {
+                                Ok(message) => match decode_incoming_message(message) {
+                                    Ok(event) => {
+                                        let _ = tx.send(event);
+                                    }
+                                    Err(detail) => {
+                                        let _ = tx.send(InternalIoEvent::IoError {
+                                            recoverable: true,
+                                            request_id: None,
+                                            detail,
+                                        });
+                                    }
+                                },
+                                Err(err) => {
+                                    let _ = tx.send(InternalIoEvent::IoError {
+                                        recoverable: true,
+                                        request_id: None,
+                                        detail: format!("subscriber recv failed: {err}"),
+                                    });
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }));
+        }
+
+        if let Some(mut socket) = request_recv.take() {
+            let tx = io_event_tx.clone();
+            req_task = Some(tokio::spawn(async move {
+                loop {
+                    match socket.recv().await {
+                        Ok(message) => match decode_incoming_message(message) {
+                            Ok(event) => {
+                                let _ = tx.send(event);
+                            }
+                            Err(detail) => {
+                                let _ = tx.send(InternalIoEvent::IoError {
+                                    recoverable: true,
+                                    request_id: None,
+                                    detail,
+                                });
+                            }
+                        },
+                        Err(err) => {
+                            let _ = tx.send(InternalIoEvent::IoError {
+                                recoverable: true,
+                                request_id: None,
+                                detail: format!("request recv failed: {err}"),
+                            });
+                            break;
+                        }
+                    }
+                }
+            }));
+        }
+
+        Ok(Self {
+            publisher,
+            sub_cmd_tx,
+            request_send,
+            io_event_rx,
+            sub_task,
+            req_task,
+        })
+    }
+
+    async fn stop(&mut self) {
+        if let Some(tx) = self.sub_cmd_tx.take() {
+            let _ = tx.send(SubControlCommand::Stop);
+        }
+        if let Some(handle) = self.sub_task.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.req_task.take() {
+            handle.abort();
+        }
+    }
+}
+
+async fn emit_state_error(
+    state: &Arc<Mutex<TransportState>>,
+    event_tx: &mpsc::Sender<RxEvent>,
+    recoverable: bool,
+    request_id: Option<RequestId>,
+    detail: &str,
+) {
+    let event = if recoverable {
+        TransportEvent::RecoverableError
+    } else {
+        TransportEvent::FatalError
+    };
+    if let Ok(mut current) = state.try_lock() {
+        let _ = transition(*current, event).map(|next| {
+            *current = next;
+        });
+    } else {
+        let mut current = state.lock().await;
+        let _ = transition(*current, event).map(|next| {
+            *current = next;
+        });
+    }
+
+    let _ = event_tx
+        .send(RxEvent::Error {
+            request_id,
+            status: ReplyStatus::Error,
+            detail: if recoverable {
+                format!("recoverable I/O error: {detail}")
+            } else {
+                format!("fatal I/O error: {detail}")
+            },
+        })
+        .await;
+}
+
+async fn emit_transport_recovery(state: &Arc<Mutex<TransportState>>) {
+    let mut current = state.lock().await;
+    let _ = transition(*current, TransportEvent::RetrySucceeded).map(|next| {
+        *current = next;
+    });
+}
+
+fn encode_u32_len_prefix(len: usize) -> Result<[u8; 4], &'static str> {
+    u32::try_from(len).map(|value| value.to_le_bytes()).map_err(|_| "frame exceeds u32 length")
+}
+
+fn encode_u64_value(value: u64) -> [u8; 8] {
+    value.to_le_bytes()
+}
+
+fn status_to_byte(status: &ReplyStatus) -> u8 {
+    match status {
+        ReplyStatus::Ok => 0,
+        ReplyStatus::Rejected => 1,
+        ReplyStatus::NotFound => 2,
+        ReplyStatus::Timeout => 3,
+        ReplyStatus::Error => 4,
+    }
+}
+
+fn byte_to_status(value: u8) -> ReplyStatus {
+    match value {
+        0 => ReplyStatus::Ok,
+        1 => ReplyStatus::Rejected,
+        2 => ReplyStatus::NotFound,
+        3 => ReplyStatus::Timeout,
+        _ => ReplyStatus::Error,
+    }
+}
+
+#[cfg(test)]
+fn encode_publish_frame(topic: &str, payload: &[u8]) -> Result<Vec<u8>, &'static str> {
+    let topic_len = encode_u32_len_prefix(topic.len())?;
+    let payload_len = encode_u32_len_prefix(payload.len())?;
+
+    let mut frame = Vec::with_capacity(1 + 4 + topic.len() + 4 + payload.len());
+    frame.push(IO_FRAME_PUBLISH);
+    frame.extend_from_slice(&topic_len);
+    frame.extend_from_slice(topic.as_bytes());
+    frame.extend_from_slice(&payload_len);
+    frame.extend_from_slice(payload);
+    Ok(frame)
+}
+
+fn encode_publish_message(topic: &str, payload: &[u8]) -> Result<ZmqMessage, &'static str> {
+    if topic.is_empty() {
+        return Err("publish topic is empty");
+    }
+    let mut message: ZmqMessage = topic.to_string().into();
+    message.push_back(payload.to_vec().into());
+    Ok(message)
+}
+
+fn encode_request_frame(request: &TxRequest) -> Result<Vec<u8>, &'static str> {
+    let topic_len = encode_u32_len_prefix(request.topic.len())?;
+    let payload_len = encode_u32_len_prefix(request.payload.len())?;
+
+    let mut frame = Vec::with_capacity(1 + 8 + 4 + request.topic.len() + 4 + request.payload.len());
+    frame.push(IO_FRAME_REQUEST);
+    frame.extend_from_slice(&encode_u64_value(request.request_id));
+    frame.extend_from_slice(&topic_len);
+    frame.extend_from_slice(request.topic.as_bytes());
+    frame.extend_from_slice(&payload_len);
+    frame.extend_from_slice(&request.payload);
+    Ok(frame)
+}
+
+fn encode_reply_frame(reply: &TxReply) -> Result<Vec<u8>, &'static str> {
+    let payload_len = encode_u32_len_prefix(reply.payload.len())?;
+
+    let mut frame = Vec::with_capacity(1 + 8 + 1 + 4 + reply.payload.len());
+    frame.push(IO_FRAME_REPLY);
+    frame.extend_from_slice(&encode_u64_value(reply.request_id));
+    frame.push(status_to_byte(&reply.status));
+    frame.extend_from_slice(&payload_len);
+    frame.extend_from_slice(&reply.payload);
+    Ok(frame)
+}
+
+fn decode_u32_frame(data: &[u8], cursor: &mut usize) -> Option<u32> {
+    if data.len().saturating_sub(*cursor) < 4 {
+        return None;
+    }
+    let value = u32::from_le_bytes([
+        data[*cursor],
+        data[*cursor + 1],
+        data[*cursor + 2],
+        data[*cursor + 3],
+    ]);
+    *cursor += 4;
+    Some(value)
+}
+
+fn decode_u64_frame(data: &[u8], cursor: &mut usize) -> Option<u64> {
+    if data.len().saturating_sub(*cursor) < 8 {
+        return None;
+    }
+    let value = u64::from_le_bytes([
+        data[*cursor],
+        data[*cursor + 1],
+        data[*cursor + 2],
+        data[*cursor + 3],
+        data[*cursor + 4],
+        data[*cursor + 5],
+        data[*cursor + 6],
+        data[*cursor + 7],
+    ]);
+    *cursor += 8;
+    Some(value)
+}
+
+fn decode_incoming_message(message: ZmqMessage) -> Result<InternalIoEvent, String> {
+    if message.len() >= 2 {
+        let topic_frame = message
+            .get(0)
+            .ok_or_else(|| "missing publish topic frame".to_string())?;
+        if let Ok(topic) = String::from_utf8(topic_frame.to_vec())
+        {
+            let payload = message
+                .get(1)
+                .ok_or_else(|| "missing publish payload frame".to_string())?
+                .to_vec();
+            return Ok(InternalIoEvent::IncomingPublish { topic, payload });
+        }
+    }
+
+    let data: Vec<u8> = message
+        .try_into()
+        .map_err(|err: &str| format!("decode zmq message failed: {err}"))?;
+    if data.is_empty() {
+        return Err("empty zmq message".to_string());
+    }
+
+    let mut cursor = 0usize;
+    match data[0] {
+        IO_FRAME_PUBLISH => {
+            cursor += 1;
+            let topic_len = decode_u32_frame(&data, &mut cursor).ok_or("invalid publish frame")?;
+            let topic_end = cursor + topic_len as usize;
+            if topic_end > data.len() {
+                return Err("invalid publish topic length".to_string());
+            }
+            let topic = String::from_utf8(data[cursor..topic_end].to_vec())
+                .map_err(|_| "invalid publish topic utf8".to_string())?;
+            cursor = topic_end;
+            let payload_len = decode_u32_frame(&data, &mut cursor).ok_or("invalid publish payload length")?;
+            let payload_end = cursor + payload_len as usize;
+            if payload_end > data.len() {
+                return Err("invalid publish payload length".to_string());
+            }
+            let payload = data[cursor..payload_end].to_vec();
+            Ok(InternalIoEvent::IncomingPublish { topic, payload })
+        }
+        IO_FRAME_REQUEST => {
+            cursor += 1;
+            let request_id = decode_u64_frame(&data, &mut cursor).ok_or("invalid request id")?;
+            let topic_len = decode_u32_frame(&data, &mut cursor).ok_or("invalid request topic length")?;
+            let topic_end = cursor + topic_len as usize;
+            if topic_end > data.len() {
+                return Err("invalid request topic length".to_string());
+            }
+            let topic = String::from_utf8(data[cursor..topic_end].to_vec())
+                .map_err(|_| "invalid request topic utf8".to_string())?;
+            cursor = topic_end;
+            let payload_len = decode_u32_frame(&data, &mut cursor).ok_or("invalid request payload length")?;
+            let payload_end = cursor + payload_len as usize;
+            if payload_end > data.len() {
+                return Err("invalid request payload length".to_string());
+            }
+            let payload = data[cursor..payload_end].to_vec();
+            Ok(InternalIoEvent::IncomingRequest {
+                request_id,
+                topic,
+                payload,
+            })
+        }
+        IO_FRAME_REPLY => {
+            cursor += 1;
+            let request_id = decode_u64_frame(&data, &mut cursor).ok_or("invalid reply id")?;
+            if data.len().saturating_sub(cursor) < 1 {
+                return Err("invalid reply status".to_string());
+            }
+            let status = byte_to_status(data[cursor]);
+            cursor += 1;
+            let payload_len = decode_u32_frame(&data, &mut cursor).ok_or("invalid reply payload length")?;
+            let payload_end = cursor + payload_len as usize;
+            if payload_end > data.len() {
+                return Err("invalid reply payload length".to_string());
+            }
+            let payload = data[cursor..payload_end].to_vec();
+            Ok(InternalIoEvent::IncomingReply {
+                request_id,
+                status,
+                payload,
+            })
+        }
+        _ => Err("unknown zmq message frame".to_string()),
+    }
+}
 
 /// Identifier used to correlate request/response messages.
 pub type RequestId = u64;
@@ -288,30 +775,147 @@ impl Default for ActorChannels {
 pub struct TransportActor;
 
 impl TransportActor {
-    /// Placeholder event loop that receives bounded inbound commands and emits outbound events.
-    /// The loop currently acts as a smoke-safe sink for command/event plumbing.
     pub async fn run_with_channels(
         command_rx: mpsc::Receiver<TxCmd>,
         control_rx: mpsc::Receiver<TxCmd>,
         event_tx: mpsc::Sender<RxEvent>,
     ) {
-        Self::run_loop(command_rx, control_rx, event_tx).await;
+        let state = Arc::new(Mutex::new(TransportState::Running));
+        Self::run_with_channels_with_config(
+            command_rx,
+            control_rx,
+            event_tx,
+            state,
+            TransportConfig::default(),
+        )
+        .await;
     }
 
-    /// Core actor entrypoint.
-    pub async fn run_loop(
+    pub async fn run_with_channels_with_config(
+        command_rx: mpsc::Receiver<TxCmd>,
+        control_rx: mpsc::Receiver<TxCmd>,
+        event_tx: mpsc::Sender<RxEvent>,
+        state: Arc<Mutex<TransportState>>,
+        config: TransportConfig,
+    ) {
+        let io_config = ActorZmqConfig::from_transport_config(&config);
+        let io_runtime = match ActorZmqRuntime::initialize(&io_config).await {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                emit_state_error(
+                    &state,
+                    &event_tx,
+                    false,
+                    None,
+                    &format!("zeromq initialization failed: {err}"),
+                )
+                .await;
+                ActorZmqRuntime::initialize(&ActorZmqConfig {
+                    enabled: false,
+                    pub_bind: None,
+                    pub_connect: Vec::new(),
+                    sub_connect: Vec::new(),
+                    req_bind: None,
+                    req_connect: Vec::new(),
+                })
+                .await
+                .expect("failed fallback zeromq runtime init")
+            }
+        };
+        Self::run_loop(command_rx, control_rx, event_tx, state, io_runtime).await;
+    }
+
+    async fn run_loop(
         mut command_rx: mpsc::Receiver<TxCmd>,
         mut control_rx: mpsc::Receiver<TxCmd>,
         event_tx: mpsc::Sender<RxEvent>,
+        state: Arc<Mutex<TransportState>>,
+        mut io_runtime: ActorZmqRuntime,
     ) {
         let pending_requests: Arc<Mutex<HashMap<RequestId, Option<u64>>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let inbound_requests: Arc<Mutex<HashSet<RequestId>>> =
+            Arc::new(Mutex::new(HashSet::new()));
         let mut command_open = true;
         let mut control_open = true;
+        let io_runtime_active =
+            io_runtime.request_send.is_some() || io_runtime.sub_cmd_tx.is_some() || io_runtime.publisher.is_some();
 
         while command_open || control_open {
             tokio::select! {
                 biased;
+                io_event = io_runtime.io_event_rx.recv(), if io_runtime_active => {
+                    match io_event {
+                        Some(InternalIoEvent::IncomingPublish { topic, payload }) => {
+                            let _ = event_tx
+                                .send(RxEvent::IncomingPublish {
+                                    topic,
+                                    payload,
+                                    headers: None,
+                                })
+                                .await;
+                            emit_transport_recovery(&state).await;
+                        }
+                        Some(InternalIoEvent::IncomingRequest {
+                            request_id,
+                            topic,
+                            payload,
+                        }) => {
+                            let mut inbound = inbound_requests.lock().await;
+                            let _ = inbound.insert(request_id);
+                            let _ = event_tx
+                                .send(RxEvent::IncomingRequest {
+                                    request_id,
+                                    topic,
+                                    payload,
+                                    headers: None,
+                                })
+                                .await;
+                            emit_transport_recovery(&state).await;
+                        }
+                        Some(InternalIoEvent::IncomingReply {
+                            request_id,
+                            status,
+                            payload,
+                        }) => {
+                            let mut pending = pending_requests.lock().await;
+                            if pending.remove(&request_id).is_some() {
+                                let _ = event_tx
+                                    .send(RxEvent::IncomingReply {
+                                        request_id,
+                                        payload,
+                                        status,
+                                        headers: None,
+                                    })
+                                    .await;
+                                emit_transport_recovery(&state).await;
+                            } else {
+                                let _ = event_tx
+                                    .send(RxEvent::Error {
+                                        request_id: Some(request_id),
+                                        status: ReplyStatus::Error,
+                                        detail: "unexpected reply id".to_string(),
+                                    })
+                                    .await;
+                            }
+                        }
+                        Some(InternalIoEvent::IoError {
+                            recoverable,
+                            request_id,
+                            detail,
+                        }) => {
+                            emit_state_error(
+                                &state,
+                                &event_tx,
+                                recoverable,
+                                request_id,
+                                &detail,
+                            )
+                            .await;
+                        }
+                        None => {}
+                    }
+                }
                 cmd = control_rx.recv(), if control_open => {
                     match cmd {
                         Some(TxCmd::Shutdown {
@@ -333,6 +937,7 @@ impl TransportActor {
                             .await;
                             let _ = event_tx.send(RxEvent::ShutdownCompleted).await;
                             let _ = ack.send(result);
+                            io_runtime.stop().await;
                             return;
                         }
                         Some(_) => {
@@ -356,13 +961,52 @@ impl TransportActor {
                             payload,
                             headers,
                         }) => {
-                            let _ = event_tx
-                                .send(RxEvent::IncomingPublish {
-                                    topic,
-                                    payload,
-                                    headers,
-                                })
-                                .await;
+                            let mut sent = false;
+                            if let Some(publisher) = io_runtime.publisher.as_mut() {
+                                match encode_publish_message(&topic, &payload) {
+                                    Ok(message) => match publisher.send(message).await {
+                                        Ok(_) => {
+                                            emit_transport_recovery(&state).await;
+                                            sent = true;
+                                        }
+                                        Err(err) => {
+                                            emit_state_error(
+                                                &state,
+                                                &event_tx,
+                                                true,
+                                                None,
+                                                &format!("publish send failed: {err}"),
+                                            )
+                                            .await;
+                                        }
+                                    },
+                                    Err(err) => {
+                                        emit_state_error(
+                                            &state,
+                                            &event_tx,
+                                            true,
+                                            None,
+                                            err,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            } else {
+                                sent = true;
+                            }
+
+                            if !sent {
+                                continue;
+                            }
+                            if io_runtime.publisher.is_none() {
+                                let _ = event_tx
+                                    .send(RxEvent::IncomingPublish {
+                                        topic,
+                                        payload,
+                                        headers,
+                                    })
+                                    .await;
+                            }
                         }
                         Some(TxCmd::SendRequest { request }) => {
                             let timeout_ms = request.timeout_ms;
@@ -390,26 +1034,165 @@ impl TransportActor {
                                 });
                             }
 
-                            let _ = event_tx
-                                .send(RxEvent::IncomingRequest {
-                                    request_id,
-                                    topic: request.topic,
-                                    payload: request.payload,
-                                    headers: request.headers,
-                                })
-                                .await;
+                            let mut dispatched = false;
+                            if let Some(request_send) = io_runtime.request_send.as_mut() {
+                                match encode_request_frame(&request) {
+                                    Ok(frame) => {
+                                        let message: ZmqMessage = frame.into();
+                                        match request_send.send(message).await {
+                                            Ok(_) => {
+                                                emit_transport_recovery(&state).await;
+                                                dispatched = true;
+                                            }
+                                            Err(err) => {
+                                                let mut pending = pending_requests.lock().await;
+                                                pending.remove(&request_id);
+                                                let _ = event_tx
+                                                    .send(RxEvent::Error {
+                                                        request_id: Some(request_id),
+                                                        status: ReplyStatus::Error,
+                                                        detail: format!("request send failed: {err}"),
+                                                    })
+                                                    .await;
+                                                emit_state_error(
+                                                    &state,
+                                                    &event_tx,
+                                                    true,
+                                                    Some(request_id),
+                                                    &format!("request send failed: {err}"),
+                                                )
+                                                .await;
+                                            }
+                                        }
+                                    }
+                                    Err(err) => {
+                                        let mut pending = pending_requests.lock().await;
+                                        pending.remove(&request_id);
+                                        let _ = event_tx
+                                            .send(RxEvent::Error {
+                                                request_id: Some(request_id),
+                                                status: ReplyStatus::Error,
+                                                detail: err.to_string(),
+                                            })
+                                            .await;
+                                        emit_state_error(
+                                            &state,
+                                            &event_tx,
+                                            true,
+                                            Some(request_id),
+                                            err,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            } else {
+                                dispatched = true;
+                            }
+
+                            if !dispatched {
+                                continue;
+                            }
+                            if io_runtime.request_send.is_none() {
+                                let _ = event_tx
+                                    .send(RxEvent::IncomingRequest {
+                                        request_id,
+                                        topic: request.topic,
+                                        payload: request.payload,
+                                        headers: request.headers,
+                                    })
+                                    .await;
+                            }
                         }
                         Some(TxCmd::SendReply { reply }) => {
-                            let mut pending = pending_requests.lock().await;
-                            if pending.remove(&reply.request_id).is_some() {
+                            if let Some(request_send) = io_runtime.request_send.as_mut() {
+                                let is_outbound = {
+                                    let mut pending = pending_requests.lock().await;
+                                    pending.remove(&reply.request_id).is_some()
+                                };
+                                let is_inbound = if is_outbound {
+                                    false
+                                } else {
+                                    let mut inbound = inbound_requests.lock().await;
+                                    inbound.remove(&reply.request_id)
+                                };
+
+                                match encode_reply_frame(&reply) {
+                                    Ok(frame) => {
+                                        let message: ZmqMessage = frame.into();
+                                        if is_outbound || is_inbound {
+                                            match request_send.send(message).await {
+                                                Ok(_) => {
+                                                    emit_transport_recovery(&state).await;
+                                                    if is_outbound {
+                                                        let _ = event_tx
+                                                            .send(RxEvent::IncomingReply {
+                                                                request_id: reply.request_id,
+                                                                payload: reply.payload,
+                                                                status: reply.status,
+                                                                headers: reply.headers,
+                                                            })
+                                                            .await;
+                                                    }
+                                                }
+                                                Err(err) => {
+                                                    let _ = event_tx
+                                                        .send(RxEvent::Error {
+                                                            request_id: Some(reply.request_id),
+                                                            status: ReplyStatus::Error,
+                                                            detail: format!("reply send failed: {err}"),
+                                                        })
+                                                        .await;
+                                                    emit_state_error(
+                                                        &state,
+                                                        &event_tx,
+                                                        true,
+                                                        Some(reply.request_id),
+                                                        &format!("reply send failed: {err}"),
+                                                    )
+                                                    .await;
+                                                }
+                                            }
+                                        } else {
+                                            let _ = event_tx
+                                                .send(RxEvent::Error {
+                                                    request_id: Some(reply.request_id),
+                                                    status: ReplyStatus::Error,
+                                                    detail: "unexpected reply id".to_string(),
+                                                })
+                                                .await;
+                                        }
+                                    }
+                                    Err(err) => {
+                                        let _ = event_tx
+                                            .send(RxEvent::Error {
+                                                request_id: Some(reply.request_id),
+                                                status: ReplyStatus::Error,
+                                                detail: err.to_string(),
+                                            })
+                                            .await;
+                                        emit_state_error(
+                                            &state,
+                                            &event_tx,
+                                            true,
+                                            Some(reply.request_id),
+                                            err,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            } else if {
+                                let mut pending = pending_requests.lock().await;
+                                pending.remove(&reply.request_id).is_some()
+                            } {
                                 let _ = event_tx
                                     .send(RxEvent::IncomingReply {
                                         request_id: reply.request_id,
                                         payload: reply.payload,
-                                        headers: reply.headers,
                                         status: reply.status,
+                                        headers: reply.headers,
                                     })
                                     .await;
+                                emit_transport_recovery(&state).await;
                             } else {
                                 let _ = event_tx
                                     .send(RxEvent::Error {
@@ -421,13 +1204,60 @@ impl TransportActor {
                             }
                         }
                         Some(TxCmd::Subscribe { topic }) => {
-                            let _ = event_tx.send(RxEvent::Subscribed { topic }).await;
+                            if let Some(sub_cmd_tx) = io_runtime.sub_cmd_tx.as_ref() {
+                                if let Err(err) = sub_cmd_tx.send(SubControlCommand::Subscribe(topic.clone())) {
+                                    let _ = event_tx
+                                        .send(RxEvent::Error {
+                                            request_id: None,
+                                            status: ReplyStatus::Error,
+                                            detail: format!("subscribe command failed: {err}"),
+                                        })
+                                        .await;
+                                    emit_state_error(
+                                        &state,
+                                        &event_tx,
+                                        true,
+                                        None,
+                                        &format!("subscribe command failed: {err}"),
+                                    )
+                                    .await;
+                                } else {
+                                    emit_transport_recovery(&state).await;
+                                    let _ = event_tx.send(RxEvent::Subscribed { topic }).await;
+                                }
+                            } else {
+                                let _ = event_tx.send(RxEvent::Subscribed { topic }).await;
+                            }
                         }
                         Some(TxCmd::Unsubscribe { topic }) => {
-                            let _ = event_tx.send(RxEvent::Unsubscribed { topic }).await;
+                            if let Some(sub_cmd_tx) = io_runtime.sub_cmd_tx.as_ref() {
+                                if let Err(err) = sub_cmd_tx.send(SubControlCommand::Unsubscribe(topic.clone())) {
+                                    let _ = event_tx
+                                        .send(RxEvent::Error {
+                                            request_id: None,
+                                            status: ReplyStatus::Error,
+                                            detail: format!("unsubscribe command failed: {err}"),
+                                        })
+                                        .await;
+                                    emit_state_error(
+                                        &state,
+                                        &event_tx,
+                                        true,
+                                        None,
+                                        &format!("unsubscribe command failed: {err}"),
+                                    )
+                                    .await;
+                                } else {
+                                    emit_transport_recovery(&state).await;
+                                    let _ = event_tx.send(RxEvent::Unsubscribed { topic }).await;
+                                }
+                            } else {
+                                let _ = event_tx.send(RxEvent::Unsubscribed { topic }).await;
+                            }
                         }
-                        Some(TxCmd::Connect { endpoint, .. }) => {
+                        Some(TxCmd::Connect { endpoint, namespace: _ }) => {
                             let _ = event_tx.send(RxEvent::Connected { endpoint }).await;
+                            emit_transport_recovery(&state).await;
                         }
                         Some(TxCmd::Disconnect { endpoint, reason }) => {
                             let _ = event_tx
@@ -558,6 +1388,14 @@ async fn shutdown_wait(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "network-tests")]
+    use std::sync::atomic::{AtomicU16, Ordering as AtomicOrdering};
+    use tokio::sync::Mutex as TokioMutex;
+    #[cfg(feature = "network-tests")]
+    use tokio::time::timeout;
+
+    #[cfg(feature = "network-tests")]
+    static NEXT_TEST_PORT: AtomicU16 = AtomicU16::new(34000);
 
     struct TestActorChannels {
         command_tx: mpsc::Sender<TxCmd>,
@@ -581,6 +1419,216 @@ mod tests {
             control_tx,
             event_rx,
         }
+    }
+
+    #[cfg(feature = "network-tests")]
+    async fn spawn_with_config(config: TransportConfig) -> (TestActorChannels, Arc<TokioMutex<TransportState>>) {
+        let channels = bounded_channels(16, 32);
+        let ActorChannels {
+            command_tx,
+            command_rx,
+            control_tx,
+            control_rx,
+            event_tx,
+            event_rx,
+        } = channels;
+        let actor_tx = event_tx.clone();
+        let state = Arc::new(TokioMutex::new(TransportState::Running));
+        tokio::spawn(TransportActor::run_with_channels_with_config(
+            command_rx,
+            control_rx,
+            actor_tx,
+            Arc::clone(&state),
+            config,
+        ));
+        (
+            TestActorChannels {
+                command_tx,
+                control_tx,
+                event_rx,
+            },
+            state,
+        )
+    }
+
+    #[cfg(feature = "network-tests")]
+    fn next_tcp_endpoint() -> String {
+        let port = NEXT_TEST_PORT.fetch_add(1, AtomicOrdering::Relaxed);
+        format!("tcp://127.0.0.1:{port}")
+    }
+
+    #[cfg(feature = "network-tests")]
+    async fn recv_until<F>(
+        event_rx: &mut mpsc::Receiver<RxEvent>,
+        wait_for: Duration,
+        mut predicate: F,
+    ) -> Option<RxEvent>
+    where
+        F: FnMut(&RxEvent) -> bool,
+    {
+        let deadline = Instant::now() + wait_for;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let remaining = deadline - now;
+            match timeout(remaining, event_rx.recv()).await {
+                Ok(Some(event)) => {
+                    if predicate(&event) {
+                        return Some(event);
+                    }
+                }
+                Ok(None) | Err(_) => return None,
+            }
+        }
+    }
+
+    #[test]
+    fn io_frame_publish_roundtrip_decodes_to_internal_event() {
+        let frame = encode_publish_frame("telemetry/temp", b"42").expect("publish frame");
+        let event = decode_incoming_message(frame.into()).expect("decode publish");
+        match event {
+            InternalIoEvent::IncomingPublish { topic, payload } => {
+                assert_eq!(topic, "telemetry/temp");
+                assert_eq!(payload, b"42".to_vec());
+            }
+            _ => panic!("expected publish event"),
+        }
+    }
+
+    #[test]
+    fn io_frame_request_roundtrip_decodes_to_internal_event() {
+        let request = TxRequest {
+            request_id: 99,
+            topic: "svc/ping".to_string(),
+            payload: b"hello".to_vec(),
+            headers: None,
+            timeout_ms: Some(123),
+        };
+        let frame = encode_request_frame(&request).expect("request frame");
+        let event = decode_incoming_message(frame.into()).expect("decode request");
+        match event {
+            InternalIoEvent::IncomingRequest {
+                request_id,
+                topic,
+                payload,
+            } => {
+                assert_eq!(request_id, 99);
+                assert_eq!(topic, "svc/ping");
+                assert_eq!(payload, b"hello".to_vec());
+            }
+            _ => panic!("expected request event"),
+        }
+    }
+
+    #[test]
+    fn io_frame_reply_roundtrip_decodes_to_internal_event() {
+        let reply = TxReply {
+            request_id: 101,
+            payload: b"world".to_vec(),
+            status: ReplyStatus::NotFound,
+            headers: None,
+        };
+        let frame = encode_reply_frame(&reply).expect("reply frame");
+        let event = decode_incoming_message(frame.into()).expect("decode reply");
+        match event {
+            InternalIoEvent::IncomingReply {
+                request_id,
+                status,
+                payload,
+            } => {
+                assert_eq!(request_id, 101);
+                assert_eq!(status, ReplyStatus::NotFound);
+                assert_eq!(payload, b"world".to_vec());
+            }
+            _ => panic!("expected reply event"),
+        }
+    }
+
+    #[test]
+    fn io_frame_decode_rejects_unknown_frame_kind() {
+        let result = decode_incoming_message(vec![0xff, 0, 1, 2].into());
+        assert!(matches!(result, Err(detail) if detail == "unknown zmq message frame"));
+    }
+
+    #[tokio::test]
+    async fn emit_state_error_updates_state_and_emits_classified_error() {
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let state = Arc::new(TokioMutex::new(TransportState::Running));
+
+        emit_state_error(&state, &event_tx, true, Some(7), "temporary").await;
+        assert_eq!(*state.lock().await, TransportState::Degraded);
+        match event_rx.recv().await {
+            Some(RxEvent::Error {
+                request_id: Some(7),
+                status: ReplyStatus::Error,
+                detail,
+            }) => assert!(detail.contains("recoverable I/O error: temporary")),
+            _ => panic!("expected recoverable io error"),
+        }
+
+        emit_state_error(&state, &event_tx, false, None, "hard-fail").await;
+        assert_eq!(*state.lock().await, TransportState::Failed);
+        match event_rx.recv().await {
+            Some(RxEvent::Error {
+                request_id: None,
+                status: ReplyStatus::Error,
+                detail,
+            }) => assert!(detail.contains("fatal I/O error: hard-fail")),
+            _ => panic!("expected fatal io error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn zeromq_init_failure_emits_fatal_event_and_transitions_state() {
+        let channels = bounded_channels(8, 8);
+        let ActorChannels {
+            command_tx: _,
+            command_rx,
+            control_tx,
+            control_rx,
+            event_tx,
+            mut event_rx,
+        } = channels;
+        let actor_tx = event_tx.clone();
+        let state = Arc::new(TokioMutex::new(TransportState::Running));
+        let config = TransportConfig {
+            enable_zeromq_io: true,
+            zeromq_pub_bind: Some("invalid://endpoint".to_string()),
+            ..TransportConfig::default()
+        };
+
+        tokio::spawn(TransportActor::run_with_channels_with_config(
+            command_rx,
+            control_rx,
+            actor_tx,
+            Arc::clone(&state),
+            config,
+        ));
+
+        match event_rx.recv().await {
+            Some(RxEvent::Error {
+                request_id: None,
+                status: ReplyStatus::Error,
+                detail,
+            }) => {
+                assert!(detail.contains("fatal I/O error"));
+                assert!(detail.contains("zeromq initialization failed"));
+            }
+            _ => panic!("expected fatal io init error event"),
+        }
+        assert_eq!(*state.lock().await, TransportState::Failed);
+
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        let _ = control_tx
+            .send(TxCmd::Shutdown {
+                graceful: true,
+                timeout_ms: Some(50),
+                ack: ack_tx,
+            })
+            .await;
+        assert!(matches!(ack_rx.await, Ok(Ok(()))));
     }
 
     #[tokio::test]
@@ -1013,6 +2061,275 @@ mod tests {
         assert!(matches!(
             actor_channels.event_rx.recv().await,
             Some(RxEvent::ShutdownCompleted)
+        ));
+    }
+
+    #[cfg(feature = "network-tests")]
+    #[tokio::test]
+    #[ignore = "requires zeromq bind/connect permissions"]
+    async fn zeromq_pub_sub_path_delivers_remote_message() {
+        let endpoint = next_tcp_endpoint();
+        let pub_config = TransportConfig {
+            enable_zeromq_io: true,
+            zeromq_pub_bind: Some(endpoint.clone()),
+            ..TransportConfig::default()
+        };
+        let sub_config = TransportConfig {
+            enable_zeromq_io: true,
+            zeromq_sub_connect: vec![endpoint],
+            ..TransportConfig::default()
+        };
+
+        let (publisher, publisher_state) = spawn_with_config(pub_config).await;
+        sleep(Duration::from_millis(200)).await;
+        let (mut subscriber, _) = spawn_with_config(sub_config).await;
+        sleep(Duration::from_millis(200)).await;
+        if *publisher_state.lock().await == TransportState::Failed {
+            eprintln!("skipping: zeromq bind/connect not permitted in this environment");
+            return;
+        }
+
+        let _ = subscriber
+            .command_tx
+            .send(TxCmd::Subscribe {
+                topic: "telemetry/temp".to_string(),
+            })
+            .await;
+        assert!(matches!(
+            recv_until(&mut subscriber.event_rx, Duration::from_secs(1), |event| {
+                matches!(event, RxEvent::Subscribed { topic } if topic == "telemetry/temp")
+            })
+            .await,
+            Some(RxEvent::Subscribed { .. })
+        ));
+
+        sleep(Duration::from_millis(100)).await;
+
+        let mut delivered = false;
+        let mut observed = Vec::new();
+        for _ in 0..20 {
+            let _ = publisher
+                .command_tx
+                .send(TxCmd::Publish {
+                    topic: "telemetry/temp".to_string(),
+                    payload: b"42".to_vec(),
+                    headers: None,
+                })
+                .await;
+
+            if let Ok(event_opt) =
+                timeout(Duration::from_millis(150), subscriber.event_rx.recv()).await
+            {
+                if let Some(event) = event_opt {
+                    match &event {
+                        RxEvent::IncomingPublish { topic, payload, .. }
+                            if topic == "telemetry/temp" && payload == b"42" =>
+                        {
+                            delivered = true;
+                            break;
+                        }
+                        _ => observed.push(format!("{event:?}")),
+                    }
+                }
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            delivered,
+            "publish message was not delivered within retry window; observed events: {observed:?}"
+        );
+
+        let (ack_tx1, ack_rx1) = tokio::sync::oneshot::channel();
+        let _ = publisher
+            .control_tx
+            .send(TxCmd::Shutdown {
+                graceful: false,
+                timeout_ms: None,
+                ack: ack_tx1,
+            })
+            .await;
+        let (ack_tx2, ack_rx2) = tokio::sync::oneshot::channel();
+        let _ = subscriber
+            .control_tx
+            .send(TxCmd::Shutdown {
+                graceful: false,
+                timeout_ms: None,
+                ack: ack_tx2,
+            })
+            .await;
+        assert!(matches!(
+            timeout(Duration::from_secs(2), ack_rx1).await,
+            Ok(Ok(Ok(())))
+        ));
+        assert!(matches!(
+            timeout(Duration::from_secs(2), ack_rx2).await,
+            Ok(Ok(Ok(())))
+        ));
+    }
+
+    #[cfg(feature = "network-tests")]
+    #[tokio::test]
+    #[ignore = "requires zeromq bind/connect permissions"]
+    async fn zeromq_request_reply_roundtrip_works_across_actors() {
+        let endpoint = next_tcp_endpoint();
+        let server_config = TransportConfig {
+            enable_zeromq_io: true,
+            zeromq_req_bind: Some(endpoint.clone()),
+            ..TransportConfig::default()
+        };
+        let client_config = TransportConfig {
+            enable_zeromq_io: true,
+            zeromq_req_connect: vec![endpoint],
+            ..TransportConfig::default()
+        };
+
+        let (mut server, server_state) = spawn_with_config(server_config).await;
+        sleep(Duration::from_millis(200)).await;
+        let (mut client, client_state) = spawn_with_config(client_config).await;
+        sleep(Duration::from_millis(200)).await;
+        if *server_state.lock().await == TransportState::Failed
+            || *client_state.lock().await == TransportState::Failed
+        {
+            eprintln!("skipping: zeromq bind/connect not permitted in this environment");
+            return;
+        }
+
+        let request_id = 9001u64;
+        let _ = client
+            .command_tx
+            .send(TxCmd::SendRequest {
+                request: TxRequest {
+                    request_id,
+                    topic: "svc/echo".to_string(),
+                    payload: b"ping".to_vec(),
+                    headers: None,
+                    timeout_ms: Some(1000),
+                },
+            })
+            .await;
+
+        assert!(matches!(
+            recv_until(&mut server.event_rx, Duration::from_secs(2), |event| {
+                matches!(
+                    event,
+                    RxEvent::IncomingRequest { request_id: rid, topic, payload, .. }
+                        if *rid == request_id && topic == "svc/echo" && payload == b"ping"
+                )
+            })
+            .await,
+            Some(RxEvent::IncomingRequest { .. })
+        ));
+
+        let _ = server
+            .command_tx
+            .send(TxCmd::SendReply {
+                reply: TxReply {
+                    request_id,
+                    payload: b"pong".to_vec(),
+                    status: ReplyStatus::Ok,
+                    headers: None,
+                },
+            })
+            .await;
+
+        assert!(matches!(
+            recv_until(&mut client.event_rx, Duration::from_secs(2), |event| {
+                matches!(
+                    event,
+                    RxEvent::IncomingReply { request_id: rid, payload, status, .. }
+                        if *rid == request_id && payload == b"pong" && *status == ReplyStatus::Ok
+                )
+            })
+            .await,
+            Some(RxEvent::IncomingReply { .. })
+        ));
+
+        let (ack_tx1, ack_rx1) = tokio::sync::oneshot::channel();
+        let _ = server
+            .control_tx
+            .send(TxCmd::Shutdown {
+                graceful: false,
+                timeout_ms: None,
+                ack: ack_tx1,
+            })
+            .await;
+        let (ack_tx2, ack_rx2) = tokio::sync::oneshot::channel();
+        let _ = client
+            .control_tx
+            .send(TxCmd::Shutdown {
+                graceful: false,
+                timeout_ms: None,
+                ack: ack_tx2,
+            })
+            .await;
+        assert!(matches!(
+            timeout(Duration::from_secs(2), ack_rx1).await,
+            Ok(Ok(Ok(())))
+        ));
+        assert!(matches!(
+            timeout(Duration::from_secs(2), ack_rx2).await,
+            Ok(Ok(Ok(())))
+        ));
+    }
+
+    #[cfg(feature = "network-tests")]
+    #[tokio::test]
+    #[ignore = "requires zeromq bind/connect permissions"]
+    async fn zeromq_invalid_frame_surfaces_error_and_degrades_state() {
+        let endpoint = next_tcp_endpoint();
+        let mut raw_pub = PubSocket::new();
+        if raw_pub.bind(&endpoint).await.is_err() {
+            eprintln!("skipping: zeromq bind/connect not permitted in this environment");
+            return;
+        }
+
+        let sub_config = TransportConfig {
+            enable_zeromq_io: true,
+            zeromq_sub_connect: vec![endpoint],
+            ..TransportConfig::default()
+        };
+        let (mut subscriber, state) = spawn_with_config(sub_config).await;
+
+        let _ = subscriber
+            .command_tx
+            .send(TxCmd::Subscribe {
+                topic: "".to_string(),
+            })
+            .await;
+        let _ = recv_until(&mut subscriber.event_rx, Duration::from_millis(500), |event| {
+            matches!(event, RxEvent::Subscribed { .. })
+        })
+        .await;
+        sleep(Duration::from_millis(100)).await;
+
+        let invalid: ZmqMessage = vec![0xff, 0x00, 0x01].into();
+        raw_pub.send(invalid).await.expect("send invalid frame");
+
+        assert!(matches!(
+            recv_until(&mut subscriber.event_rx, Duration::from_secs(2), |event| {
+                matches!(
+                    event,
+                    RxEvent::Error { status: ReplyStatus::Error, detail, .. }
+                        if detail.contains("recoverable I/O error")
+                )
+            })
+            .await,
+            Some(RxEvent::Error { .. })
+        ));
+        assert_eq!(*state.lock().await, TransportState::Degraded);
+
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        let _ = subscriber
+            .control_tx
+            .send(TxCmd::Shutdown {
+                graceful: false,
+                timeout_ms: None,
+                ack: ack_tx,
+            })
+            .await;
+        assert!(matches!(
+            timeout(Duration::from_secs(2), ack_rx).await,
+            Ok(Ok(Ok(())))
         ));
     }
 }

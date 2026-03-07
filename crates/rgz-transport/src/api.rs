@@ -71,10 +71,12 @@ impl Transport {
             DEFAULT_EVENT_CHANNEL_CAPACITY,
         );
         let actor_tx = actor_channels.event_tx.clone();
-        let actor_task = tokio::spawn(TransportActor::run_with_channels(
+        let actor_task = tokio::spawn(TransportActor::run_with_channels_with_config(
             actor_channels.command_rx,
             actor_channels.control_rx,
             actor_tx,
+            Arc::clone(&self.state),
+            self.config.clone(),
         ));
 
         Ok(TransportHandle {

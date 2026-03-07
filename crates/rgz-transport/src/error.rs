@@ -13,6 +13,12 @@ pub enum TransportError {
 
     #[error("transport is not running")]
     NotRunning,
+
+    #[error("transport I/O error: recoverable={recoverable}, detail={detail}")]
+    IoError {
+        detail: String,
+        recoverable: bool,
+    },
 }
 
 pub type TransportResult<T> = Result<T, TransportError>;
