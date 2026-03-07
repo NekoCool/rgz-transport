@@ -1,0 +1,25 @@
+labels:
+  - name: transport-v2
+    color: 0E8A16
+    description: Transport rewrite for rgz-transport.
+  - name: architecture
+    color: 1D76DB
+    description: Architecture and design decisions for transport.
+  - name: implementation
+    color: FBCA04
+    description: Implementation tasks for transport rewrite.
+  - name: validation
+    color: D93F0B
+    description: Tests and validation tasks.
+  - name: docs
+    color: C5DEF5
+    description: Documentation and notes for the transport rewrite.
+  - name: breaking-change
+    color: B60205
+    description: Breaking API change intentionally planned.
+  - name: zeromq
+    color: 5319E7
+    description: Official zeromq crate integration.
+  - name: tokio
+    color: 0052CC
+    description: Tokio async runtime related work.
