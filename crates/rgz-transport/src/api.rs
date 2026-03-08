@@ -1,17 +1,16 @@
-use crate::actor::{
-    bounded_channels_with_control, ReplyStatus, TxCmd, TxRequest, TxReply,
-    DEFAULT_SHUTDOWN_TIMEOUT_MS, RxEvent, RequestId,
-    RequestIdGenerator,
-};
 use crate::actor::TransportActor;
+use crate::actor::{
+    DEFAULT_SHUTDOWN_TIMEOUT_MS, ReplyStatus, RequestId, RequestIdGenerator, RxEvent, TxCmd,
+    TxReply, TxRequest, bounded_channels_with_control,
+};
 use crate::config::TransportConfig;
 use crate::error::{TransportError, TransportResult};
 use crate::state::{TransportEvent, TransportState, transition};
 use std::sync::Arc;
-use tokio::sync::oneshot;
-use tokio::sync::{mpsc, Mutex};
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::time::{timeout, Duration};
+use tokio::sync::oneshot;
+use tokio::sync::{Mutex, mpsc};
+use tokio::time::{Duration, timeout};
 
 /// Main transport entrypoint for v2.
 pub struct Transport {
@@ -56,9 +55,11 @@ impl Transport {
 
         let started = {
             let state = self.state.lock().await;
-            transition(*state, TransportEvent::StartOk).map_err(|_| TransportError::InvalidTransition {
-                from: *state,
-                event: TransportEvent::StartOk,
+            transition(*state, TransportEvent::StartOk).map_err(|_| {
+                TransportError::InvalidTransition {
+                    from: *state,
+                    event: TransportEvent::StartOk,
+                }
             })?
         };
 
@@ -129,12 +130,8 @@ impl TransportHandle {
 
     pub async fn send_cmd(&self, cmd: TxCmd) -> TransportResult<()> {
         match cmd {
-            TxCmd::Shutdown { .. } => {
-                self.try_send_control(cmd)
-            }
-            _ => {
-                self.try_send_command(cmd)
-            }
+            TxCmd::Shutdown { .. } => self.try_send_control(cmd),
+            _ => self.try_send_command(cmd),
         }
     }
 
@@ -189,11 +186,15 @@ impl TransportHandle {
     }
 
     pub async fn subscribe(&self, topic: impl Into<String>) -> TransportResult<()> {
-        self.try_send_command(TxCmd::Subscribe { topic: topic.into() })
+        self.try_send_command(TxCmd::Subscribe {
+            topic: topic.into(),
+        })
     }
 
     pub async fn unsubscribe(&self, topic: impl Into<String>) -> TransportResult<()> {
-        self.try_send_command(TxCmd::Unsubscribe { topic: topic.into() })
+        self.try_send_command(TxCmd::Unsubscribe {
+            topic: topic.into(),
+        })
     }
 
     pub async fn connect(
@@ -275,8 +276,7 @@ impl TransportHandle {
             *state = next_state;
         }
 
-        self.wait_for_shutdown_complete(timeout_ms, ack_rx)
-            .await?;
+        self.wait_for_shutdown_complete(timeout_ms, ack_rx).await?;
 
         {
             let mut state = self.state.lock().await;
@@ -352,8 +352,18 @@ mod tests {
 
         let ok_count = usize::from(first.is_ok()) + usize::from(second.is_ok());
         assert_eq!(ok_count, 1);
-        assert!(matches!(first, Ok(()) | Err(TransportError::InvalidTransition { .. }) | Err(TransportError::NotRunning)));
-        assert!(matches!(second, Ok(()) | Err(TransportError::InvalidTransition { .. }) | Err(TransportError::NotRunning)));
+        assert!(matches!(
+            first,
+            Ok(())
+                | Err(TransportError::InvalidTransition { .. })
+                | Err(TransportError::NotRunning)
+        ));
+        assert!(matches!(
+            second,
+            Ok(())
+                | Err(TransportError::InvalidTransition { .. })
+                | Err(TransportError::NotRunning)
+        ));
 
         assert_eq!(handle.state().await, TransportState::Stopped);
     }
@@ -382,7 +392,10 @@ mod tests {
         };
 
         let result = handle.publish("topic/full", vec![2], None).await;
-        assert!(matches!(result, Err(TransportError::NodeBusy { path: "command" })));
+        assert!(matches!(
+            result,
+            Err(TransportError::NodeBusy { path: "command" })
+        ));
     }
 
     #[tokio::test]
@@ -410,6 +423,9 @@ mod tests {
         };
 
         let result = handle.shutdown_cmd(true, Some(10)).await;
-        assert!(matches!(result, Err(TransportError::NodeBusy { path: "control" })));
+        assert!(matches!(
+            result,
+            Err(TransportError::NodeBusy { path: "control" })
+        ));
     }
 }

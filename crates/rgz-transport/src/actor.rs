@@ -5,24 +5,21 @@
 //! mapped in the adapter layer instead.
 
 use serde::{Deserialize, Serialize};
-use std::convert::TryInto;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::convert::TryInto;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
-use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use tokio::time::{sleep, sleep_until, Duration, Instant};
+use tokio::time::{Duration, Instant, sleep, sleep_until};
 
 use crate::config::TransportConfig;
 use crate::error::TransportResult;
-use crate::state::{transition, TransportEvent, TransportState};
+use crate::state::{TransportEvent, TransportState, transition};
 use tracing::warn;
-use zeromq::{
-    prelude::*,
-    DealerSendHalf, DealerSocket, PubSocket, SubSocket, ZmqMessage,
-};
+use zeromq::{DealerSendHalf, DealerSocket, PubSocket, SubSocket, ZmqMessage, prelude::*};
 
 /// Default capacity for the inbound command channel.
 pub const DEFAULT_COMMAND_CHANNEL_CAPACITY: usize = 128;
@@ -105,9 +102,7 @@ struct ActorZmqRuntime {
 }
 
 impl ActorZmqRuntime {
-    async fn initialize(
-        config: &ActorZmqConfig,
-    ) -> Result<Self, String> {
+    async fn initialize(config: &ActorZmqConfig) -> Result<Self, String> {
         if !config.enabled {
             let (_, io_event_rx) = mpsc::channel(1);
             return Ok(Self {
@@ -131,7 +126,10 @@ impl ActorZmqRuntime {
                 socket.bind(endpoint).await.map_err(|err| err.to_string())?;
             }
             for endpoint in &config.pub_connect {
-                socket.connect(endpoint).await.map_err(|err| err.to_string())?;
+                socket
+                    .connect(endpoint)
+                    .await
+                    .map_err(|err| err.to_string())?;
             }
         }
 
@@ -142,23 +140,30 @@ impl ActorZmqRuntime {
         };
         if let Some(socket) = subscriber.as_mut() {
             for endpoint in &config.sub_connect {
-                socket.connect(endpoint).await.map_err(|err| err.to_string())?;
+                socket
+                    .connect(endpoint)
+                    .await
+                    .map_err(|err| err.to_string())?;
             }
         }
 
-        let (request_send, mut request_recv) = if config.req_bind.is_none() && config.req_connect.is_empty() {
-            (None, None)
-        } else {
-            let mut socket = DealerSocket::new();
-            if let Some(endpoint) = &config.req_bind {
-                socket.bind(endpoint).await.map_err(|err| err.to_string())?;
-            }
-            for endpoint in &config.req_connect {
-                socket.connect(endpoint).await.map_err(|err| err.to_string())?;
-            }
-            let (send_half, recv_half) = socket.split();
-            (Some(send_half), Some(recv_half))
-        };
+        let (request_send, mut request_recv) =
+            if config.req_bind.is_none() && config.req_connect.is_empty() {
+                (None, None)
+            } else {
+                let mut socket = DealerSocket::new();
+                if let Some(endpoint) = &config.req_bind {
+                    socket.bind(endpoint).await.map_err(|err| err.to_string())?;
+                }
+                for endpoint in &config.req_connect {
+                    socket
+                        .connect(endpoint)
+                        .await
+                        .map_err(|err| err.to_string())?;
+                }
+                let (send_half, recv_half) = socket.split();
+                (Some(send_half), Some(recv_half))
+            };
 
         let (io_event_tx, io_event_rx) = mpsc::channel::<InternalIoEvent>(config.io_event_capacity);
         let mut sub_task = None;
@@ -230,19 +235,25 @@ impl ActorZmqRuntime {
                         Ok(message) => match decode_incoming_message(message) {
                             Ok(event) => try_emit_io_event(&tx, event),
                             Err(detail) => {
-                                try_emit_io_event(&tx, InternalIoEvent::IoError {
-                                    recoverable: true,
-                                    request_id: None,
-                                    detail,
-                                });
+                                try_emit_io_event(
+                                    &tx,
+                                    InternalIoEvent::IoError {
+                                        recoverable: true,
+                                        request_id: None,
+                                        detail,
+                                    },
+                                );
                             }
                         },
                         Err(err) => {
-                            try_emit_io_event(&tx, InternalIoEvent::IoError {
-                                recoverable: true,
-                                request_id: None,
-                                detail: format!("request recv failed: {err}"),
-                            });
+                            try_emit_io_event(
+                                &tx,
+                                InternalIoEvent::IoError {
+                                    recoverable: true,
+                                    request_id: None,
+                                    detail: format!("request recv failed: {err}"),
+                                },
+                            );
                             break;
                         }
                     }
@@ -338,7 +349,9 @@ async fn emit_transport_recovery(state: &Arc<Mutex<TransportState>>) {
 }
 
 fn encode_u32_len_prefix(len: usize) -> Result<[u8; 4], &'static str> {
-    u32::try_from(len).map(|value| value.to_le_bytes()).map_err(|_| "frame exceeds u32 length")
+    u32::try_from(len)
+        .map(|value| value.to_le_bytes())
+        .map_err(|_| "frame exceeds u32 length")
 }
 
 fn encode_u64_value(value: u64) -> [u8; 8] {
@@ -451,8 +464,7 @@ fn decode_incoming_message(message: ZmqMessage) -> Result<InternalIoEvent, Strin
         let topic_frame = message
             .get(0)
             .ok_or_else(|| "missing publish topic frame".to_string())?;
-        if let Ok(topic) = String::from_utf8(topic_frame.to_vec())
-        {
+        if let Ok(topic) = String::from_utf8(topic_frame.to_vec()) {
             let payload = message
                 .get(1)
                 .ok_or_else(|| "missing publish payload frame".to_string())?
@@ -480,7 +492,8 @@ fn decode_incoming_message(message: ZmqMessage) -> Result<InternalIoEvent, Strin
             let topic = String::from_utf8(data[cursor..topic_end].to_vec())
                 .map_err(|_| "invalid publish topic utf8".to_string())?;
             cursor = topic_end;
-            let payload_len = decode_u32_frame(&data, &mut cursor).ok_or("invalid publish payload length")?;
+            let payload_len =
+                decode_u32_frame(&data, &mut cursor).ok_or("invalid publish payload length")?;
             let payload_end = cursor + payload_len as usize;
             if payload_end > data.len() {
                 return Err("invalid publish payload length".to_string());
@@ -491,7 +504,8 @@ fn decode_incoming_message(message: ZmqMessage) -> Result<InternalIoEvent, Strin
         IO_FRAME_REQUEST => {
             cursor += 1;
             let request_id = decode_u64_frame(&data, &mut cursor).ok_or("invalid request id")?;
-            let topic_len = decode_u32_frame(&data, &mut cursor).ok_or("invalid request topic length")?;
+            let topic_len =
+                decode_u32_frame(&data, &mut cursor).ok_or("invalid request topic length")?;
             let topic_end = cursor + topic_len as usize;
             if topic_end > data.len() {
                 return Err("invalid request topic length".to_string());
@@ -499,7 +513,8 @@ fn decode_incoming_message(message: ZmqMessage) -> Result<InternalIoEvent, Strin
             let topic = String::from_utf8(data[cursor..topic_end].to_vec())
                 .map_err(|_| "invalid request topic utf8".to_string())?;
             cursor = topic_end;
-            let payload_len = decode_u32_frame(&data, &mut cursor).ok_or("invalid request payload length")?;
+            let payload_len =
+                decode_u32_frame(&data, &mut cursor).ok_or("invalid request payload length")?;
             let payload_end = cursor + payload_len as usize;
             if payload_end > data.len() {
                 return Err("invalid request payload length".to_string());
@@ -519,7 +534,8 @@ fn decode_incoming_message(message: ZmqMessage) -> Result<InternalIoEvent, Strin
             }
             let status = byte_to_status(data[cursor]);
             cursor += 1;
-            let payload_len = decode_u32_frame(&data, &mut cursor).ok_or("invalid reply payload length")?;
+            let payload_len =
+                decode_u32_frame(&data, &mut cursor).ok_or("invalid reply payload length")?;
             let payload_end = cursor + payload_len as usize;
             if payload_end > data.len() {
                 return Err("invalid reply payload length".to_string());
@@ -774,10 +790,7 @@ impl RequestIdGenerator {
 }
 
 /// Create bounded command and event channels for actor integration.
-pub fn bounded_channels(
-    command_capacity: usize,
-    event_capacity: usize,
-) -> ActorChannels {
+pub fn bounded_channels(command_capacity: usize, event_capacity: usize) -> ActorChannels {
     bounded_channels_with_control(command_capacity, command_capacity, event_capacity)
 }
 
@@ -802,7 +815,10 @@ pub fn bounded_channels_with_control(
 
 impl Default for ActorChannels {
     fn default() -> Self {
-        bounded_channels(DEFAULT_COMMAND_CHANNEL_CAPACITY, DEFAULT_EVENT_CHANNEL_CAPACITY)
+        bounded_channels(
+            DEFAULT_COMMAND_CHANNEL_CAPACITY,
+            DEFAULT_EVENT_CHANNEL_CAPACITY,
+        )
     }
 }
 
@@ -871,12 +887,12 @@ impl TransportActor {
     ) {
         let pending_requests: Arc<Mutex<HashMap<RequestId, Option<u64>>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let inbound_requests: Arc<Mutex<HashSet<RequestId>>> =
-            Arc::new(Mutex::new(HashSet::new()));
+        let inbound_requests: Arc<Mutex<HashSet<RequestId>>> = Arc::new(Mutex::new(HashSet::new()));
         let mut command_open = true;
         let mut control_open = true;
-        let io_runtime_active =
-            io_runtime.request_send.is_some() || io_runtime.sub_cmd_tx.is_some() || io_runtime.publisher.is_some();
+        let io_runtime_active = io_runtime.request_send.is_some()
+            || io_runtime.sub_cmd_tx.is_some()
+            || io_runtime.publisher.is_some();
 
         while command_open || control_open {
             tokio::select! {
@@ -1475,7 +1491,9 @@ mod tests {
             event_rx,
         } = channels;
         let actor_tx = event_tx.clone();
-        tokio::spawn(TransportActor::run_with_channels(command_rx, control_rx, actor_tx));
+        tokio::spawn(TransportActor::run_with_channels(
+            command_rx, control_rx, actor_tx,
+        ));
         TestActorChannels {
             command_tx,
             control_tx,
@@ -1484,7 +1502,9 @@ mod tests {
     }
 
     #[cfg(feature = "network-tests")]
-    async fn spawn_with_config(config: TransportConfig) -> (TestActorChannels, Arc<TokioMutex<TransportState>>) {
+    async fn spawn_with_config(
+        config: TransportConfig,
+    ) -> (TestActorChannels, Arc<TokioMutex<TransportState>>) {
         let channels = bounded_channels(16, 32);
         let ActorChannels {
             command_tx,
@@ -2200,10 +2220,7 @@ mod tests {
             actor_channels.event_rx.recv().await,
             Some(RxEvent::ShutdownRequested)
         ));
-        assert!(matches!(
-            ack_rx.await,
-            Ok(Ok(()))
-        ));
+        assert!(matches!(ack_rx.await, Ok(Ok(()))));
         assert!(matches!(
             actor_channels.event_rx.recv().await,
             Some(RxEvent::ShutdownCompleted)
@@ -2442,9 +2459,11 @@ mod tests {
                 topic: "".to_string(),
             })
             .await;
-        let _ = recv_until(&mut subscriber.event_rx, Duration::from_millis(500), |event| {
-            matches!(event, RxEvent::Subscribed { .. })
-        })
+        let _ = recv_until(
+            &mut subscriber.event_rx,
+            Duration::from_millis(500),
+            |event| matches!(event, RxEvent::Subscribed { .. }),
+        )
         .await;
         sleep(Duration::from_millis(100)).await;
 

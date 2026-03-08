@@ -8,10 +8,10 @@ pub mod state;
 pub mod transport;
 
 pub use actor::{
-    bounded_channels, bounded_channels_with_control, ActorChannels, MessageHeaders,
-    MessagePayload, ReplyStatus, RequestId, RequestIdGenerator, RxEvent, TxCmd, TxReply,
-    TxRequest, DEFAULT_COMMAND_CHANNEL_CAPACITY, DEFAULT_EVENT_CHANNEL_CAPACITY,
-    DEFAULT_IO_EVENT_CHANNEL_CAPACITY, DEFAULT_SUB_CMD_CHANNEL_CAPACITY,
+    ActorChannels, DEFAULT_COMMAND_CHANNEL_CAPACITY, DEFAULT_EVENT_CHANNEL_CAPACITY,
+    DEFAULT_IO_EVENT_CHANNEL_CAPACITY, DEFAULT_SUB_CMD_CHANNEL_CAPACITY, MessageHeaders,
+    MessagePayload, ReplyStatus, RequestId, RequestIdGenerator, RxEvent, TxCmd, TxReply, TxRequest,
+    bounded_channels, bounded_channels_with_control,
 };
 pub use api::{Transport, TransportHandle};
 pub use config::TransportConfig;

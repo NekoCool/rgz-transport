@@ -150,15 +150,7 @@ pub mod discovery {
         }
         /// / \brief Defines the different options for the scope of a topic/service.
         #[derive(
-            Clone,
-            Copy,
-            Debug,
-            PartialEq,
-            Eq,
-            Hash,
-            PartialOrd,
-            Ord,
-            ::prost::Enumeration
+            Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration,
         )]
         #[repr(i32)]
         pub enum Scope {
@@ -206,17 +198,7 @@ pub mod discovery {
         }
     }
     /// / \brief Type of discovery message.
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum Type {
         /// / \brief Type not initialized.
@@ -364,10 +346,8 @@ pub struct FuelMetadata {
     pub tags: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     /// A list of key-value pairs that can contain arbitrary user data.
     #[prost(map = "string, string", tag = "9")]
-    pub annotations: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        ::prost::alloc::string::String,
-    >,
+    pub annotations:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
     /// / \brief Resources that this resource depends on.
     #[prost(message, repeated, tag = "10")]
     pub dependencies: ::prost::alloc::vec::Vec<fuel_metadata::Dependency>,
@@ -1114,17 +1094,7 @@ pub struct Geometry {
 }
 /// Nested message and enum types in `Geometry`.
 pub mod geometry {
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum Type {
         Box = 0,
@@ -1317,15 +1287,7 @@ pub mod material {
     pub mod pbr {
         /// / \brief Type of PBR workflow
         #[derive(
-            Clone,
-            Copy,
-            Debug,
-            PartialEq,
-            Eq,
-            Hash,
-            PartialOrd,
-            Ord,
-            ::prost::Enumeration
+            Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration,
         )]
         #[repr(i32)]
         pub enum WorkflowType {
@@ -1359,17 +1321,7 @@ pub mod material {
             }
         }
     }
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum ShaderType {
         Vertex = 0,
@@ -1461,17 +1413,7 @@ pub mod visual {
         #[prost(int32, tag = "1")]
         pub layer: i32,
     }
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum Type {
         /// / \brief Entity visual
@@ -1579,17 +1521,7 @@ pub struct SensorNoise {
 /// Nested message and enum types in `SensorNoise`.
 pub mod sensor_noise {
     /// / \brief Noise types
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum Type {
         /// / \brief No noise
@@ -1696,17 +1628,7 @@ pub struct Light {
 }
 /// Nested message and enum types in `Light`.
 pub mod light {
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum LightType {
         Point = 0,
@@ -1768,17 +1690,7 @@ pub struct Entity {
 /// Nested message and enum types in `Entity`.
 pub mod entity {
     /// / \brief Entity type
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum Type {
         /// / \brief No type specified
@@ -2063,17 +1975,7 @@ pub struct BatteryState {
 }
 /// Nested message and enum types in `BatteryState`.
 pub mod battery_state {
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum PowerSupplyStatus {
         Unknown = 0,
@@ -2146,10 +2048,7 @@ pub struct EntityWrenchMap {
     pub header: ::core::option::Option<Header>,
     /// / \brief The map of entity wrench messages.
     #[prost(map = "string, message", tag = "2")]
-    pub wrenches: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        EntityWrench,
-    >,
+    pub wrenches: ::std::collections::HashMap<::prost::alloc::string::String, EntityWrench>,
 }
 #[derive(::rgz_derive::GzMessage)]
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -2259,17 +2158,7 @@ pub struct ParticleEmitter {
 /// Nested message and enum types in `ParticleEmitter`.
 pub mod particle_emitter {
     /// / \brief All possible emitter types.
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum EmitterType {
         /// / \brief Point emitter.
@@ -2456,17 +2345,7 @@ pub struct Lens {
 /// Nested message and enum types in `Lens`.
 pub mod lens {
     /// / \brief Types of lens models.
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum Type {
         NotSpecified = 0,
@@ -2508,17 +2387,7 @@ pub mod lens {
         }
     }
     /// / \brief Lens custom function type.
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum FunctionType {
         FunctionNotSpecified = 0,
@@ -2624,17 +2493,7 @@ pub struct CameraSensor {
 /// Nested message and enum types in `CameraSensor`.
 pub mod camera_sensor {
     /// / \brief Bounding box types.
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum BoundingBoxType {
         /// / \brief No bounding box.
@@ -2671,17 +2530,7 @@ pub mod camera_sensor {
         }
     }
     /// / \brief Segmentation types.
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum SegmentationType {
         /// / \brief No segmentation.
@@ -2791,9 +2640,7 @@ pub struct ImuSensor {
     pub linear_acceleration: ::core::option::Option<imu_sensor::LinearAcceleration>,
     /// / \brief Orientation reference frame information.
     #[prost(message, optional, tag = "4")]
-    pub orientation_ref_frame: ::core::option::Option<
-        imu_sensor::OrientationReferenceFrame,
-    >,
+    pub orientation_ref_frame: ::core::option::Option<imu_sensor::OrientationReferenceFrame>,
 }
 /// Nested message and enum types in `IMUSensor`.
 pub mod imu_sensor {
@@ -3131,17 +2978,7 @@ pub mod joint {
         #[prost(double, tag = "1")]
         pub thread_pitch: f64,
     }
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum Type {
         Revolute = 0,
@@ -3521,17 +3358,7 @@ pub struct UserCmd {
 /// Nested message and enum types in `UserCmd`.
 pub mod user_cmd {
     /// / \brief Types of user commands
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum Type {
         /// / \brief Moving an entity.
@@ -3600,17 +3427,7 @@ pub struct DvlKinematicEstimate {
 /// Nested message and enum types in `DVLKinematicEstimate`.
 pub mod dvl_kinematic_estimate {
     /// / \brief Frames of reference (incl. conventions)
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum ReferenceType {
         /// / \brief Unspecific frame of reference.
@@ -3687,17 +3504,7 @@ pub struct DvlTrackingTarget {
 /// Nested message and enum types in `DVLTrackingTarget`.
 pub mod dvl_tracking_target {
     /// / \brief Target types
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum TargetType {
         /// / \brief Unspecific target type.
@@ -3757,17 +3564,7 @@ pub struct DvlVelocityTracking {
 /// Nested message and enum types in `DVLVelocityTracking`.
 pub mod dvl_velocity_tracking {
     /// / \brief DVL types.
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum DvlType {
         /// / \brief Unspecific DVL type.
@@ -3867,17 +3664,7 @@ pub struct ParameterError {
 }
 /// Nested message and enum types in `ParameterError`.
 pub mod parameter_error {
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum Type {
         Success = 0,
@@ -4091,17 +3878,7 @@ pub struct RestResponse {
 }
 /// Nested message and enum types in `RestResponse`.
 pub mod rest_response {
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum Type {
         /// / \brief Rest service call was successful
@@ -4613,17 +4390,7 @@ pub struct Marker {
 /// Nested message and enum types in `Marker`.
 pub mod marker {
     /// / \brief The marker type (shape/geometry)
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum Type {
         None = 0,
@@ -4692,17 +4459,7 @@ pub mod marker {
         }
     }
     /// / \brief Visilibity defines what cameras render the marker.
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum Visibility {
         /// / \brief Only cameras for user interaction render the visual. Other
@@ -4732,17 +4489,7 @@ pub mod marker {
         }
     }
     /// / \brief How to interpret the data.
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum Action {
         /// / \brief Use this action to create a new marker or modify an existing
@@ -5125,15 +4872,7 @@ pub mod point_cloud_packed {
     pub mod field {
         /// Datatype for the point field.
         #[derive(
-            Clone,
-            Copy,
-            Debug,
-            PartialEq,
-            Eq,
-            Hash,
-            PartialOrd,
-            Ord,
-            ::prost::Enumeration
+            Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration,
         )]
         #[repr(i32)]
         pub enum DataType {
@@ -5419,17 +5158,7 @@ pub struct Any {
 /// Nested message and enum types in `Any`.
 pub mod any {
     /// / \brief The type of data the message contains.
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum ValueType {
         /// / \brief Indicates that the message is empty
@@ -5567,17 +5296,7 @@ pub struct Physics {
 }
 /// Nested message and enum types in `Physics`.
 pub mod physics {
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum Type {
         Ode = 0,
@@ -5667,17 +5386,7 @@ pub struct Fog {
 }
 /// Nested message and enum types in `Fog`.
 pub mod fog {
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum FogType {
         None = 0,
@@ -5849,15 +5558,7 @@ pub mod camera_info {
     pub mod distortion {
         /// / \brief Types of distortion models.
         #[derive(
-            Clone,
-            Copy,
-            Debug,
-            PartialEq,
-            Eq,
-            Hash,
-            PartialOrd,
-            Ord,
-            ::prost::Enumeration
+            Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration,
         )]
         #[repr(i32)]
         pub enum DistortionModelType {
@@ -6285,15 +5986,7 @@ pub mod log_status {
     /// Nested message and enum types in `LogFile`.
     pub mod log_file {
         #[derive(
-            Clone,
-            Copy,
-            Debug,
-            PartialEq,
-            Eq,
-            Hash,
-            PartialOrd,
-            Ord,
-            ::prost::Enumeration
+            Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration,
         )]
         #[repr(i32)]
         pub enum Units {
@@ -6420,17 +6113,7 @@ pub struct Shadows {
 }
 /// Nested message and enum types in `Shadows`.
 pub mod shadows {
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum ShadowType {
         StencilAdditive = 0,
@@ -6589,17 +6272,7 @@ pub struct SphericalCoordinates {
 /// Nested message and enum types in `SphericalCoordinates`.
 pub mod spherical_coordinates {
     /// / \brief Planetary surface models.
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum SurfaceModel {
         /// / \brief World Geodetic System 1984
@@ -6838,17 +6511,7 @@ pub struct Statistic {
 /// Nested message and enum types in `Statistic`.
 pub mod statistic {
     /// / \brief The type of data represented by this statistic.
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum DataType {
         /// / \brief The data type has not been initialized.
@@ -6964,17 +6627,7 @@ pub struct Atmosphere {
 /// Nested message and enum types in `Atmosphere`.
 pub mod atmosphere {
     /// / \brief Types of atmosphere models.
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum Type {
         /// / \brief Adiabatic atmosphere model.
@@ -7090,17 +6743,7 @@ pub struct DataLoadPathOptions {
 /// Nested message and enum types in `DataLoadPathOptions`.
 pub mod data_load_path_options {
     /// / \brief Units used by spherical coordinates
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum DataAngularUnits {
         Radians = 0,
@@ -7155,9 +6798,8 @@ pub struct SdfGeneratorConfig {
     pub header: ::core::option::Option<Header>,
     /// / \brief Global setting for SDFormat generation of entities
     #[prost(message, optional, tag = "2")]
-    pub global_entity_gen_config: ::core::option::Option<
-        sdf_generator_config::EntityGeneratorConfig,
-    >,
+    pub global_entity_gen_config:
+        ::core::option::Option<sdf_generator_config::EntityGeneratorConfig>,
     /// / \brief Per-entity override of global settings for SDFormat generation.
     /// / The key is the scoped name of an entity.
     #[prost(map = "string, message", tag = "3")]

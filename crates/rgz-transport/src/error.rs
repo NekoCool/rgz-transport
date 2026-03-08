@@ -12,23 +12,16 @@ pub enum TransportError {
     Timeout,
 
     #[error("node is busy: queue full on {path}")]
-    NodeBusy {
-        path: &'static str,
-    },
+    NodeBusy { path: &'static str },
 
     #[error("transport is not running")]
     NotRunning,
 
     #[error("operation rejected: {detail}")]
-    Rejected {
-        detail: String,
-    },
+    Rejected { detail: String },
 
     #[error("transport I/O error: recoverable={recoverable}, detail={detail}")]
-    IoError {
-        detail: String,
-        recoverable: bool,
-    },
+    IoError { detail: String, recoverable: bool },
 }
 
 pub type TransportResult<T> = Result<T, TransportError>;
