@@ -1247,29 +1247,33 @@ impl TransportActor {
                                         .await;
                                     }
                                 }
-                            } else if {
-                                let mut pending = pending_requests.lock().await;
-                                pending.remove(&reply.request_id).is_some()
-                            } {
-                                try_emit_event(
-                                    &event_tx,
-                                    RxEvent::IncomingReply {
-                                        request_id: reply.request_id,
-                                        payload: reply.payload,
-                                        status: reply.status,
-                                        headers: reply.headers,
-                                    },
-                                );
-                                emit_transport_recovery(&state).await;
                             } else {
-                                try_emit_event(
-                                    &event_tx,
-                                    RxEvent::Error {
-                                        request_id: Some(reply.request_id),
-                                        status: ReplyStatus::Error,
-                                        detail: "unexpected reply id".to_string(),
-                                    },
-                                );
+                                let is_pending_reply = {
+                                    let mut pending = pending_requests.lock().await;
+                                    pending.remove(&reply.request_id).is_some()
+                                };
+
+                                if is_pending_reply {
+                                    try_emit_event(
+                                        &event_tx,
+                                        RxEvent::IncomingReply {
+                                            request_id: reply.request_id,
+                                            payload: reply.payload,
+                                            status: reply.status,
+                                            headers: reply.headers,
+                                        },
+                                    );
+                                    emit_transport_recovery(&state).await;
+                                } else {
+                                    try_emit_event(
+                                        &event_tx,
+                                        RxEvent::Error {
+                                            request_id: Some(reply.request_id),
+                                            status: ReplyStatus::Error,
+                                            detail: "unexpected reply id".to_string(),
+                                        },
+                                    );
+                                }
                             }
                         }
                         Some(TxCmd::Subscribe { topic }) => {
@@ -1694,10 +1698,11 @@ mod tests {
             event_rx.recv().await,
             Some(RxEvent::Connected { endpoint }) if endpoint == "inproc://first"
         ));
-        assert!(matches!(
-            timeout(Duration::from_millis(20), event_rx.recv()).await,
-            Err(_)
-        ));
+        assert!(
+            timeout(Duration::from_millis(20), event_rx.recv())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1723,10 +1728,11 @@ mod tests {
             Some(InternalIoEvent::IncomingPublish { topic, payload })
                 if topic == "telemetry/first" && payload == vec![1]
         ));
-        assert!(matches!(
-            timeout(Duration::from_millis(20), io_rx.recv()).await,
-            Err(_)
-        ));
+        assert!(
+            timeout(Duration::from_millis(20), io_rx.recv())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -2199,7 +2205,7 @@ mod tests {
             actor_channels.event_rx.recv().await,
             Some(RxEvent::ShutdownCompleted)
         ));
-        assert!(matches!(actor_channels.event_rx.recv().await, None));
+        assert!(actor_channels.event_rx.recv().await.is_none());
     }
 
     #[tokio::test]
