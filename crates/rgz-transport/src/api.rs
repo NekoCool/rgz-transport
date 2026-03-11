@@ -5,6 +5,7 @@ use crate::actor::{
 };
 use crate::config::TransportConfig;
 use crate::error::{TransportError, TransportResult};
+use crate::metrics::{TransportMetrics, TransportMetricsSnapshot};
 use crate::state::{TransportEvent, TransportState, transition};
 use std::sync::Arc;
 use tokio::sync::mpsc::error::TrySendError;
@@ -22,6 +23,7 @@ pub struct Transport {
 pub struct TransportHandle {
     state: Arc<Mutex<TransportState>>,
     config: TransportConfig,
+    metrics: Arc<TransportMetrics>,
     command_tx: mpsc::Sender<TxCmd>,
     control_tx: mpsc::Sender<TxCmd>,
     event_rx: Arc<Mutex<mpsc::Receiver<RxEvent>>>,
@@ -73,6 +75,7 @@ impl Transport {
             self.config.control_channel_capacity,
             self.config.event_channel_capacity,
         );
+        let metrics = Arc::new(TransportMetrics::default());
         let actor_tx = actor_channels.event_tx.clone();
         let actor_task = tokio::spawn(TransportActor::run_with_channels_with_config(
             actor_channels.command_rx,
@@ -80,11 +83,13 @@ impl Transport {
             actor_tx,
             Arc::clone(&self.state),
             self.config.clone(),
+            Arc::clone(&metrics),
         ));
 
         Ok(TransportHandle {
             state: Arc::clone(&self.state),
             config: self.config,
+            metrics,
             command_tx: actor_channels.command_tx,
             control_tx: actor_channels.control_tx,
             event_rx: Arc::new(Mutex::new(actor_channels.event_rx)),
@@ -112,10 +117,17 @@ impl TransportHandle {
         self.request_id_gen.next()
     }
 
+    pub fn metrics_snapshot(&self) -> TransportMetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
     fn try_send_command(&self, cmd: TxCmd) -> TransportResult<()> {
         match self.command_tx.try_send(cmd) {
             Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => Err(TransportError::NodeBusy { path: "command" }),
+            Err(TrySendError::Full(_)) => {
+                self.metrics.inc_command_full();
+                Err(TransportError::NodeBusy { path: "command" })
+            }
             Err(TrySendError::Closed(_)) => Err(TransportError::NotRunning),
         }
     }
@@ -123,7 +135,10 @@ impl TransportHandle {
     fn try_send_control(&self, cmd: TxCmd) -> TransportResult<()> {
         match self.control_tx.try_send(cmd) {
             Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => Err(TransportError::NodeBusy { path: "control" }),
+            Err(TrySendError::Full(_)) => {
+                self.metrics.inc_control_full();
+                Err(TransportError::NodeBusy { path: "control" })
+            }
             Err(TrySendError::Closed(_)) => Err(TransportError::NotRunning),
         }
     }
@@ -384,6 +399,7 @@ mod tests {
         let handle = TransportHandle {
             state: Arc::new(Mutex::new(TransportState::Running)),
             config: TransportConfig::default(),
+            metrics: Arc::new(TransportMetrics::default()),
             command_tx,
             control_tx,
             event_rx: Arc::new(Mutex::new(event_rx)),
@@ -415,6 +431,7 @@ mod tests {
         let handle = TransportHandle {
             state: Arc::new(Mutex::new(TransportState::Running)),
             config: TransportConfig::default(),
+            metrics: Arc::new(TransportMetrics::default()),
             command_tx,
             control_tx,
             event_rx: Arc::new(Mutex::new(event_rx)),

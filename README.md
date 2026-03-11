@@ -75,6 +75,8 @@ Default channel policy:
 | `io_event` | `2048` | `DropNewest` (existing queued events are preserved) |
 | `sub_cmd` | `512` | error event (`subscribe/unsubscribe command failed`) |
 
+Queue saturation counters are tracked in-memory and exposed via `TransportHandle::metrics_snapshot()`.
+
 Backpressure handling example:
 
 ```rust

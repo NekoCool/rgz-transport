@@ -120,6 +120,7 @@ stateDiagram-v2
 補足:
 - `event/io_event` は `try_send` を使い、満杯時に新着イベントを破棄する。
 - shutdown 経路は `control` を優先し、満杯時は即時 `NodeBusy` で確定させる。
+- queue 飽和は `command_full_total`, `control_full_total`, `event_dropped_total`, `io_event_dropped_total`, `sub_cmd_full_total` として観測する。
 
 ## 8. 実装マッピング（暫定）
 
