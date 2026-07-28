@@ -42,12 +42,8 @@ impl Transport {
     pub async fn start(self) -> TransportResult<TransportHandle> {
         let next = {
             let state = self.state.lock().await;
-            transition(*state, TransportEvent::InitRequested).map_err(|_| {
-                TransportError::InvalidTransition {
-                    from: *state,
-                    event: TransportEvent::InitRequested,
-                }
-            })?
+            transition(*state, TransportEvent::InitRequested)
+                .map_err(|_| TransportError::invalid_transition(*state, TransportEvent::InitRequested))?
         };
 
         {
@@ -57,12 +53,8 @@ impl Transport {
 
         let started = {
             let state = self.state.lock().await;
-            transition(*state, TransportEvent::StartOk).map_err(|_| {
-                TransportError::InvalidTransition {
-                    from: *state,
-                    event: TransportEvent::StartOk,
-                }
-            })?
+            transition(*state, TransportEvent::StartOk)
+                .map_err(|_| TransportError::invalid_transition(*state, TransportEvent::StartOk))?
         };
 
         {
@@ -128,7 +120,7 @@ impl TransportHandle {
                 self.metrics.inc_command_full();
                 Err(TransportError::NodeBusy { path: "command" })
             }
-            Err(TrySendError::Closed(_)) => Err(TransportError::NotRunning),
+            Err(TrySendError::Closed(_)) => Err(TransportError::not_running()),
         }
     }
 
@@ -139,7 +131,7 @@ impl TransportHandle {
                 self.metrics.inc_control_full();
                 Err(TransportError::NodeBusy { path: "control" })
             }
-            Err(TrySendError::Closed(_)) => Err(TransportError::NotRunning),
+            Err(TrySendError::Closed(_)) => Err(TransportError::not_running()),
         }
     }
 
@@ -273,7 +265,7 @@ impl TransportHandle {
         let next_state = {
             let state = self.state.lock().await;
             if *state == TransportState::Stopped {
-                return Err(TransportError::NotRunning);
+                return Err(TransportError::not_running());
             }
 
             transition(*state, TransportEvent::ShutdownRequested)?
@@ -314,7 +306,7 @@ impl TransportHandle {
         let wait_res = timeout(Duration::from_millis(timeout_ms), ack_rx).await;
 
         match wait_res {
-            Ok(result) => result.map_err(|_| TransportError::NotRunning)?,
+            Ok(result) => result.map_err(|_| TransportError::not_running())?,
             Err(_) => {
                 self.actor_task.abort();
                 let mut state = self.state.lock().await;
@@ -353,7 +345,7 @@ mod tests {
         assert_eq!(state, TransportState::Stopped);
 
         let second = handle.shutdown().await;
-        assert!(matches!(second, Err(TransportError::NotRunning)));
+        assert!(matches!(second, Err(TransportError::InvalidState { .. })));
     }
 
     #[tokio::test]
@@ -370,14 +362,12 @@ mod tests {
         assert!(matches!(
             first,
             Ok(())
-                | Err(TransportError::InvalidTransition { .. })
-                | Err(TransportError::NotRunning)
+                | Err(TransportError::InvalidState { .. })
         ));
         assert!(matches!(
             second,
             Ok(())
-                | Err(TransportError::InvalidTransition { .. })
-                | Err(TransportError::NotRunning)
+                | Err(TransportError::InvalidState { .. })
         ));
 
         assert_eq!(handle.state().await, TransportState::Stopped);

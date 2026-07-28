@@ -16,7 +16,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant, sleep, sleep_until};
 
 use crate::config::TransportConfig;
-use crate::error::TransportResult;
+use crate::error::{TransportError, TransportResult};
 use crate::metrics::TransportMetrics;
 use crate::state::{TransportEvent, TransportState, transition};
 use tracing::warn;
@@ -53,8 +53,7 @@ enum InternalIoEvent {
         payload: MessagePayload,
     },
     IoError {
-        recoverable: bool,
-        detail: String,
+        error: TransportError,
         request_id: Option<RequestId>,
     },
 }
@@ -187,18 +186,16 @@ impl ActorZmqRuntime {
                                 Some(SubControlCommand::Subscribe(topic)) => {
                                     if let Err(err) = socket.subscribe(&topic).await {
                                         try_emit_io_event(&tx, metrics.as_ref(), InternalIoEvent::IoError {
-                                            recoverable: true,
+                                            error: TransportError::TemporaryTransport(format!("subscribe failed: {err}")),
                                             request_id: None,
-                                            detail: format!("subscribe failed: {err}"),
                                         });
                                     }
                                 }
                                 Some(SubControlCommand::Unsubscribe(topic)) => {
                                     if let Err(err) = socket.unsubscribe(&topic).await {
                                         try_emit_io_event(&tx, metrics.as_ref(), InternalIoEvent::IoError {
-                                            recoverable: true,
+                                            error: TransportError::TemporaryTransport(format!("unsubscribe failed: {err}")),
                                             request_id: None,
-                                            detail: format!("unsubscribe failed: {err}"),
                                         });
                                     }
                                 }
@@ -209,19 +206,17 @@ impl ActorZmqRuntime {
                             match recv {
                                 Ok(message) => match decode_incoming_message(message) {
                                     Ok(event) => try_emit_io_event(&tx, metrics.as_ref(), event),
-                                    Err(detail) => {
+                                    Err(error) => {
                                         try_emit_io_event(&tx, metrics.as_ref(), InternalIoEvent::IoError {
-                                            recoverable: true,
+                                            error,
                                             request_id: None,
-                                            detail,
                                         });
                                     }
                                 },
                                 Err(err) => {
                                     try_emit_io_event(&tx, metrics.as_ref(), InternalIoEvent::IoError {
-                                        recoverable: true,
+                                        error: TransportError::TemporaryTransport(format!("subscriber recv failed: {err}")),
                                         request_id: None,
-                                        detail: format!("subscriber recv failed: {err}"),
                                     });
                                     break;
                                 }
@@ -240,14 +235,13 @@ impl ActorZmqRuntime {
                     match socket.recv().await {
                         Ok(message) => match decode_incoming_message(message) {
                             Ok(event) => try_emit_io_event(&tx, metrics.as_ref(), event),
-                            Err(detail) => {
+                            Err(error) => {
                                 try_emit_io_event(
                                     &tx,
                                     metrics.as_ref(),
                                     InternalIoEvent::IoError {
-                                        recoverable: true,
+                                        error,
                                         request_id: None,
-                                        detail,
                                     },
                                 );
                             }
@@ -257,9 +251,8 @@ impl ActorZmqRuntime {
                                 &tx,
                                 metrics.as_ref(),
                                 InternalIoEvent::IoError {
-                                    recoverable: true,
+                                    error: TransportError::TemporaryTransport(format!("request recv failed: {err}")),
                                     request_id: None,
-                                    detail: format!("request recv failed: {err}"),
                                 },
                             );
                             break;
@@ -322,10 +315,10 @@ async fn emit_state_error(
     state: &Arc<Mutex<TransportState>>,
     event_tx: &mpsc::Sender<RxEvent>,
     metrics: &TransportMetrics,
-    recoverable: bool,
     request_id: Option<RequestId>,
-    detail: &str,
+    error: TransportError,
 ) {
+    let recoverable = error.is_retryable();
     let event = if recoverable {
         TransportEvent::RecoverableError
     } else {
@@ -347,12 +340,8 @@ async fn emit_state_error(
         metrics,
         RxEvent::Error {
             request_id,
-            status: ReplyStatus::Error,
-            detail: if recoverable {
-                format!("recoverable I/O error: {detail}")
-            } else {
-                format!("fatal I/O error: {detail}")
-            },
+            status: reply_status_for_error(&error),
+            detail: error.to_string(),
         },
     );
 }
@@ -364,10 +353,36 @@ async fn emit_transport_recovery(state: &Arc<Mutex<TransportState>>) {
     });
 }
 
-fn encode_u32_len_prefix(len: usize) -> Result<[u8; 4], &'static str> {
+fn reply_status_for_error(error: &TransportError) -> ReplyStatus {
+    match error {
+        TransportError::InvalidState { .. } => ReplyStatus::Rejected,
+        TransportError::ServiceNotFound(_) => ReplyStatus::NotFound,
+        TransportError::Timeout => ReplyStatus::Timeout,
+        _ => ReplyStatus::Error,
+    }
+}
+
+fn emit_error_event(
+    event_tx: &mpsc::Sender<RxEvent>,
+    metrics: &TransportMetrics,
+    request_id: Option<RequestId>,
+    error: TransportError,
+) {
+    try_emit_event(
+        event_tx,
+        metrics,
+        RxEvent::Error {
+            request_id,
+            status: reply_status_for_error(&error),
+            detail: error.to_string(),
+        },
+    );
+}
+
+fn encode_u32_len_prefix(len: usize) -> Result<[u8; 4], TransportError> {
     u32::try_from(len)
         .map(|value| value.to_le_bytes())
-        .map_err(|_| "frame exceeds u32 length")
+        .map_err(|_| TransportError::Serialization("frame exceeds u32 length".to_string()))
 }
 
 fn encode_u64_value(value: u64) -> [u8; 8] {
@@ -395,7 +410,7 @@ fn byte_to_status(value: u8) -> ReplyStatus {
 }
 
 #[cfg(test)]
-fn encode_publish_frame(topic: &str, payload: &[u8]) -> Result<Vec<u8>, &'static str> {
+fn encode_publish_frame(topic: &str, payload: &[u8]) -> Result<Vec<u8>, TransportError> {
     let topic_len = encode_u32_len_prefix(topic.len())?;
     let payload_len = encode_u32_len_prefix(payload.len())?;
 
@@ -408,16 +423,18 @@ fn encode_publish_frame(topic: &str, payload: &[u8]) -> Result<Vec<u8>, &'static
     Ok(frame)
 }
 
-fn encode_publish_message(topic: &str, payload: &[u8]) -> Result<ZmqMessage, &'static str> {
+fn encode_publish_message(topic: &str, payload: &[u8]) -> Result<ZmqMessage, TransportError> {
     if topic.is_empty() {
-        return Err("publish topic is empty");
+        return Err(TransportError::Serialization(
+            "publish topic is empty".to_string(),
+        ));
     }
     let mut message: ZmqMessage = topic.to_string().into();
     message.push_back(payload.to_vec().into());
     Ok(message)
 }
 
-fn encode_request_frame(request: &TxRequest) -> Result<Vec<u8>, &'static str> {
+fn encode_request_frame(request: &TxRequest) -> Result<Vec<u8>, TransportError> {
     let topic_len = encode_u32_len_prefix(request.topic.len())?;
     let payload_len = encode_u32_len_prefix(request.payload.len())?;
 
@@ -431,7 +448,7 @@ fn encode_request_frame(request: &TxRequest) -> Result<Vec<u8>, &'static str> {
     Ok(frame)
 }
 
-fn encode_reply_frame(reply: &TxReply) -> Result<Vec<u8>, &'static str> {
+fn encode_reply_frame(reply: &TxReply) -> Result<Vec<u8>, TransportError> {
     let payload_len = encode_u32_len_prefix(reply.payload.len())?;
 
     let mut frame = Vec::with_capacity(1 + 8 + 1 + 4 + reply.payload.len());
@@ -475,15 +492,15 @@ fn decode_u64_frame(data: &[u8], cursor: &mut usize) -> Option<u64> {
     Some(value)
 }
 
-fn decode_incoming_message(message: ZmqMessage) -> Result<InternalIoEvent, String> {
+fn decode_incoming_message(message: ZmqMessage) -> Result<InternalIoEvent, TransportError> {
     if message.len() >= 2 {
         let topic_frame = message
             .get(0)
-            .ok_or_else(|| "missing publish topic frame".to_string())?;
+            .ok_or_else(|| TransportError::Serialization("missing publish topic frame".to_string()))?;
         if let Ok(topic) = String::from_utf8(topic_frame.to_vec()) {
             let payload = message
                 .get(1)
-                .ok_or_else(|| "missing publish payload frame".to_string())?
+                .ok_or_else(|| TransportError::Serialization("missing publish payload frame".to_string()))?
                 .to_vec();
             return Ok(InternalIoEvent::IncomingPublish { topic, payload });
         }
@@ -491,49 +508,62 @@ fn decode_incoming_message(message: ZmqMessage) -> Result<InternalIoEvent, Strin
 
     let data: Vec<u8> = message
         .try_into()
-        .map_err(|err: &str| format!("decode zmq message failed: {err}"))?;
+        .map_err(|err: &str| TransportError::Serialization(format!("decode zmq message failed: {err}")))?;
     if data.is_empty() {
-        return Err("empty zmq message".to_string());
+        return Err(TransportError::Serialization("empty zmq message".to_string()));
     }
 
     let mut cursor = 0usize;
     match data[0] {
         IO_FRAME_PUBLISH => {
             cursor += 1;
-            let topic_len = decode_u32_frame(&data, &mut cursor).ok_or("invalid publish frame")?;
+            let topic_len = decode_u32_frame(&data, &mut cursor)
+                .ok_or_else(|| TransportError::Serialization("invalid publish frame".to_string()))?;
             let topic_end = cursor + topic_len as usize;
             if topic_end > data.len() {
-                return Err("invalid publish topic length".to_string());
+                return Err(TransportError::Serialization(
+                    "invalid publish topic length".to_string(),
+                ));
             }
             let topic = String::from_utf8(data[cursor..topic_end].to_vec())
-                .map_err(|_| "invalid publish topic utf8".to_string())?;
+                .map_err(|_| TransportError::Serialization("invalid publish topic utf8".to_string()))?;
             cursor = topic_end;
-            let payload_len =
-                decode_u32_frame(&data, &mut cursor).ok_or("invalid publish payload length")?;
+            let payload_len = decode_u32_frame(&data, &mut cursor).ok_or_else(|| {
+                TransportError::Serialization("invalid publish payload length".to_string())
+            })?;
             let payload_end = cursor + payload_len as usize;
             if payload_end > data.len() {
-                return Err("invalid publish payload length".to_string());
+                return Err(TransportError::Serialization(
+                    "invalid publish payload length".to_string(),
+                ));
             }
             let payload = data[cursor..payload_end].to_vec();
             Ok(InternalIoEvent::IncomingPublish { topic, payload })
         }
         IO_FRAME_REQUEST => {
             cursor += 1;
-            let request_id = decode_u64_frame(&data, &mut cursor).ok_or("invalid request id")?;
-            let topic_len =
-                decode_u32_frame(&data, &mut cursor).ok_or("invalid request topic length")?;
+            let request_id = decode_u64_frame(&data, &mut cursor)
+                .ok_or_else(|| TransportError::Serialization("invalid request id".to_string()))?;
+            let topic_len = decode_u32_frame(&data, &mut cursor).ok_or_else(|| {
+                TransportError::Serialization("invalid request topic length".to_string())
+            })?;
             let topic_end = cursor + topic_len as usize;
             if topic_end > data.len() {
-                return Err("invalid request topic length".to_string());
+                return Err(TransportError::Serialization(
+                    "invalid request topic length".to_string(),
+                ));
             }
             let topic = String::from_utf8(data[cursor..topic_end].to_vec())
-                .map_err(|_| "invalid request topic utf8".to_string())?;
+                .map_err(|_| TransportError::Serialization("invalid request topic utf8".to_string()))?;
             cursor = topic_end;
-            let payload_len =
-                decode_u32_frame(&data, &mut cursor).ok_or("invalid request payload length")?;
+            let payload_len = decode_u32_frame(&data, &mut cursor).ok_or_else(|| {
+                TransportError::Serialization("invalid request payload length".to_string())
+            })?;
             let payload_end = cursor + payload_len as usize;
             if payload_end > data.len() {
-                return Err("invalid request payload length".to_string());
+                return Err(TransportError::Serialization(
+                    "invalid request payload length".to_string(),
+                ));
             }
             let payload = data[cursor..payload_end].to_vec();
             Ok(InternalIoEvent::IncomingRequest {
@@ -544,17 +574,21 @@ fn decode_incoming_message(message: ZmqMessage) -> Result<InternalIoEvent, Strin
         }
         IO_FRAME_REPLY => {
             cursor += 1;
-            let request_id = decode_u64_frame(&data, &mut cursor).ok_or("invalid reply id")?;
+            let request_id = decode_u64_frame(&data, &mut cursor)
+                .ok_or_else(|| TransportError::Serialization("invalid reply id".to_string()))?;
             if data.len().saturating_sub(cursor) < 1 {
-                return Err("invalid reply status".to_string());
+                return Err(TransportError::Serialization("invalid reply status".to_string()));
             }
             let status = byte_to_status(data[cursor]);
             cursor += 1;
-            let payload_len =
-                decode_u32_frame(&data, &mut cursor).ok_or("invalid reply payload length")?;
+            let payload_len = decode_u32_frame(&data, &mut cursor).ok_or_else(|| {
+                TransportError::Serialization("invalid reply payload length".to_string())
+            })?;
             let payload_end = cursor + payload_len as usize;
             if payload_end > data.len() {
-                return Err("invalid reply payload length".to_string());
+                return Err(TransportError::Serialization(
+                    "invalid reply payload length".to_string(),
+                ));
             }
             let payload = data[cursor..payload_end].to_vec();
             Ok(InternalIoEvent::IncomingReply {
@@ -563,7 +597,9 @@ fn decode_incoming_message(message: ZmqMessage) -> Result<InternalIoEvent, Strin
                 payload,
             })
         }
-        _ => Err("unknown zmq message frame".to_string()),
+        _ => Err(TransportError::Serialization(
+            "unknown zmq message frame".to_string(),
+        )),
     }
 }
 
@@ -876,9 +912,8 @@ impl TransportActor {
                     &state,
                     &event_tx,
                     metrics.as_ref(),
-                    false,
                     None,
-                    &format!("zeromq initialization failed: {err}"),
+                    TransportError::Internal(format!("zeromq initialization failed: {err}")),
                 )
                 .await;
                 ActorZmqRuntime::initialize(
@@ -973,29 +1008,24 @@ impl TransportActor {
                                 );
                                 emit_transport_recovery(&state).await;
                             } else {
-                                try_emit_event(
+                                emit_error_event(
                                     &event_tx,
                                     metrics.as_ref(),
-                                    RxEvent::Error {
-                                        request_id: Some(request_id),
-                                        status: ReplyStatus::Error,
-                                        detail: "unexpected reply id".to_string(),
-                                    },
+                                    Some(request_id),
+                                    TransportError::Internal("unexpected reply id".to_string()),
                                 );
                             }
                         }
                         Some(InternalIoEvent::IoError {
-                            recoverable,
+                            error,
                             request_id,
-                            detail,
                         }) => {
                             emit_state_error(
                                 &state,
                                 &event_tx,
                                 metrics.as_ref(),
-                                recoverable,
                                 request_id,
-                                &detail,
+                                error,
                             )
                             .await;
                         }
@@ -1028,12 +1058,11 @@ impl TransportActor {
                             return;
                         }
                         Some(_) => {
-                            try_emit_event(
+                            emit_error_event(
                                 &event_tx,
                                 metrics.as_ref(),
-                                RxEvent::Error {
-                                    request_id: None,
-                                    status: ReplyStatus::Rejected,
+                                None,
+                                TransportError::InvalidState {
                                     detail: "non-shutdown command sent on control channel".to_string(),
                                 },
                             );
@@ -1063,9 +1092,8 @@ impl TransportActor {
                                                 &state,
                                                 &event_tx,
                                                 metrics.as_ref(),
-                                                true,
                                                 None,
-                                                &format!("publish send failed: {err}"),
+                                                TransportError::TemporaryTransport(format!("publish send failed: {err}")),
                                             )
                                             .await;
                                         }
@@ -1075,7 +1103,6 @@ impl TransportActor {
                                             &state,
                                             &event_tx,
                                             metrics.as_ref(),
-                                            true,
                                             None,
                                             err,
                                         )
@@ -1117,14 +1144,11 @@ impl TransportActor {
                                     sleep(Duration::from_millis(timeout_ms)).await;
                                     let mut pending = pending_requests.lock().await;
                                     if pending.remove(&request_id).is_some() {
-                                        try_emit_event(
+                                        emit_error_event(
                                             &timeout_tx,
                                             timeout_metrics.as_ref(),
-                                            RxEvent::Error {
-                                                request_id: Some(request_id),
-                                                status: ReplyStatus::Timeout,
-                                                detail: "request timed out".to_string(),
-                                            },
+                                            Some(request_id),
+                                            TransportError::Timeout,
                                         );
                                     }
                                 });
@@ -1143,22 +1167,18 @@ impl TransportActor {
                                             Err(err) => {
                                                 let mut pending = pending_requests.lock().await;
                                                 pending.remove(&request_id);
-                                                try_emit_event(
+                                                emit_error_event(
                                                     &event_tx,
                                                     metrics.as_ref(),
-                                                    RxEvent::Error {
-                                                        request_id: Some(request_id),
-                                                        status: ReplyStatus::Error,
-                                                        detail: format!("request send failed: {err}"),
-                                                    },
+                                                    Some(request_id),
+                                                    TransportError::TemporaryTransport(format!("request send failed: {err}")),
                                                 );
                                                 emit_state_error(
                                                     &state,
                                                     &event_tx,
                                                     metrics.as_ref(),
-                                                    true,
                                                     Some(request_id),
-                                                    &format!("request send failed: {err}"),
+                                                    TransportError::TemporaryTransport(format!("request send failed: {err}")),
                                                 )
                                                 .await;
                                             }
@@ -1167,20 +1187,16 @@ impl TransportActor {
                                     Err(err) => {
                                         let mut pending = pending_requests.lock().await;
                                         pending.remove(&request_id);
-                                        try_emit_event(
+                                        emit_error_event(
                                             &event_tx,
                                             metrics.as_ref(),
-                                            RxEvent::Error {
-                                                request_id: Some(request_id),
-                                                status: ReplyStatus::Error,
-                                                detail: err.to_string(),
-                                            },
+                                            Some(request_id),
+                                            err.clone(),
                                         );
                                         emit_state_error(
                                             &state,
                                             &event_tx,
                                             metrics.as_ref(),
-                                            true,
                                             Some(request_id),
                                             err,
                                         )
@@ -1241,53 +1257,42 @@ impl TransportActor {
                                                     }
                                                 }
                                                 Err(err) => {
-                                                    try_emit_event(
+                                                    emit_error_event(
                                                         &event_tx,
                                                         metrics.as_ref(),
-                                                        RxEvent::Error {
-                                                            request_id: Some(reply.request_id),
-                                                            status: ReplyStatus::Error,
-                                                            detail: format!("reply send failed: {err}"),
-                                                        },
+                                                        Some(reply.request_id),
+                                                        TransportError::TemporaryTransport(format!("reply send failed: {err}")),
                                                     );
                                                     emit_state_error(
                                                         &state,
                                                         &event_tx,
                                                         metrics.as_ref(),
-                                                        true,
                                                         Some(reply.request_id),
-                                                        &format!("reply send failed: {err}"),
+                                                        TransportError::TemporaryTransport(format!("reply send failed: {err}")),
                                                     )
                                                     .await;
                                                 }
                                             }
                                         } else {
-                                            try_emit_event(
+                                            emit_error_event(
                                                 &event_tx,
                                                 metrics.as_ref(),
-                                                RxEvent::Error {
-                                                    request_id: Some(reply.request_id),
-                                                    status: ReplyStatus::Error,
-                                                    detail: "unexpected reply id".to_string(),
-                                                },
+                                                Some(reply.request_id),
+                                                TransportError::Internal("unexpected reply id".to_string()),
                                             );
                                         }
                                     }
                                     Err(err) => {
-                                        try_emit_event(
+                                        emit_error_event(
                                             &event_tx,
                                             metrics.as_ref(),
-                                            RxEvent::Error {
-                                                request_id: Some(reply.request_id),
-                                                status: ReplyStatus::Error,
-                                                detail: err.to_string(),
-                                            },
+                                            Some(reply.request_id),
+                                            err.clone(),
                                         );
                                         emit_state_error(
                                             &state,
                                             &event_tx,
                                             metrics.as_ref(),
-                                            true,
                                             Some(reply.request_id),
                                             err,
                                         )
@@ -1313,14 +1318,11 @@ impl TransportActor {
                                     );
                                     emit_transport_recovery(&state).await;
                                 } else {
-                                    try_emit_event(
+                                    emit_error_event(
                                         &event_tx,
                                         metrics.as_ref(),
-                                        RxEvent::Error {
-                                            request_id: Some(reply.request_id),
-                                            status: ReplyStatus::Error,
-                                            detail: "unexpected reply id".to_string(),
-                                        },
+                                        Some(reply.request_id),
+                                        TransportError::Internal("unexpected reply id".to_string()),
                                     );
                                 }
                             }
@@ -1329,22 +1331,18 @@ impl TransportActor {
                             if let Some(sub_cmd_tx) = io_runtime.sub_cmd_tx.as_ref() {
                                 if let Err(err) = sub_cmd_tx.try_send(SubControlCommand::Subscribe(topic.clone())) {
                                     metrics.inc_sub_cmd_full();
-                                    try_emit_event(
+                                    emit_error_event(
                                         &event_tx,
                                         metrics.as_ref(),
-                                        RxEvent::Error {
-                                            request_id: None,
-                                            status: ReplyStatus::Error,
-                                            detail: format!("subscribe command failed: {err}"),
-                                        },
+                                        None,
+                                        TransportError::TemporaryTransport(format!("subscribe command failed: {err}")),
                                     );
                                     emit_state_error(
                                         &state,
                                         &event_tx,
                                         metrics.as_ref(),
-                                        true,
                                         None,
-                                        &format!("subscribe command failed: {err}"),
+                                        TransportError::TemporaryTransport(format!("subscribe command failed: {err}")),
                                     )
                                     .await;
                                 } else {
@@ -1359,22 +1357,18 @@ impl TransportActor {
                             if let Some(sub_cmd_tx) = io_runtime.sub_cmd_tx.as_ref() {
                                 if let Err(err) = sub_cmd_tx.try_send(SubControlCommand::Unsubscribe(topic.clone())) {
                                     metrics.inc_sub_cmd_full();
-                                    try_emit_event(
+                                    emit_error_event(
                                         &event_tx,
                                         metrics.as_ref(),
-                                        RxEvent::Error {
-                                            request_id: None,
-                                            status: ReplyStatus::Error,
-                                            detail: format!("unsubscribe command failed: {err}"),
-                                        },
+                                        None,
+                                        TransportError::TemporaryTransport(format!("unsubscribe command failed: {err}")),
                                     );
                                     emit_state_error(
                                         &state,
                                         &event_tx,
                                         metrics.as_ref(),
-                                        true,
                                         None,
-                                        &format!("unsubscribe command failed: {err}"),
+                                        TransportError::TemporaryTransport(format!("unsubscribe command failed: {err}")),
                                     )
                                     .await;
                                 } else {
@@ -1400,12 +1394,11 @@ impl TransportActor {
                             );
                         }
                         Some(TxCmd::Shutdown { .. }) => {
-                            try_emit_event(
+                            emit_error_event(
                                 &event_tx,
                                 metrics.as_ref(),
-                                RxEvent::Error {
-                                    request_id: None,
-                                    status: ReplyStatus::Rejected,
+                                None,
+                                TransportError::InvalidState {
                                     detail: "shutdown command sent on normal channel".to_string(),
                                 },
                             );
@@ -1434,12 +1427,11 @@ async fn shutdown_wait(
 ) -> TransportResult<()> {
     if !graceful {
         for request_id in pending_requests.drain().map(|(request_id, _)| request_id) {
-            try_emit_event(
+            emit_error_event(
                 event_tx,
                 metrics,
-                RxEvent::Error {
-                    request_id: Some(request_id),
-                    status: ReplyStatus::Error,
+                Some(request_id),
+                TransportError::InvalidState {
                     detail: "actor shutting down".to_string(),
                 },
             );
@@ -1461,12 +1453,11 @@ async fn shutdown_wait(
                         let _ = ack.send(Ok(()));
                     }
                     Some(_) => {
-                        try_emit_event(
+                        emit_error_event(
                             event_tx,
                             metrics,
-                            RxEvent::Error {
-                                request_id: None,
-                                status: ReplyStatus::Rejected,
+                            None,
+                            TransportError::InvalidState {
                                 detail: "command rejected during graceful shutdown".to_string(),
                             },
                         );
@@ -1489,24 +1480,20 @@ async fn shutdown_wait(
                                 },
                             );
                         } else {
-                            try_emit_event(
+                            emit_error_event(
                                 event_tx,
                                 metrics,
-                                RxEvent::Error {
-                                    request_id: Some(reply.request_id),
-                                    status: ReplyStatus::Error,
-                                    detail: "unexpected reply id".to_string(),
-                                },
+                                Some(reply.request_id),
+                                TransportError::Internal("unexpected reply id".to_string()),
                             );
                         }
                     }
                     Some(_) => {
-                        try_emit_event(
+                        emit_error_event(
                             event_tx,
                             metrics,
-                            RxEvent::Error {
-                                request_id: None,
-                                status: ReplyStatus::Rejected,
+                            None,
+                            TransportError::InvalidState {
                                 detail: "command rejected during graceful shutdown".to_string(),
                             },
                         );
@@ -1516,14 +1503,11 @@ async fn shutdown_wait(
             }
             _ = sleep_until(deadline) => {
                 for (request_id, _) in pending_requests.drain() {
-                    try_emit_event(
+                    emit_error_event(
                         event_tx,
                         metrics,
-                        RxEvent::Error {
-                            request_id: Some(request_id),
-                            status: ReplyStatus::Timeout,
-                            detail: "request timed out during shutdown".to_string(),
-                        },
+                        Some(request_id),
+                        TransportError::Timeout,
                     );
                 }
                 return Ok(());
@@ -1700,7 +1684,10 @@ mod tests {
     #[test]
     fn io_frame_decode_rejects_unknown_frame_kind() {
         let result = decode_incoming_message(vec![0xff, 0, 1, 2].into());
-        assert!(matches!(result, Err(detail) if detail == "unknown zmq message frame"));
+        assert!(matches!(
+            result,
+            Err(TransportError::Serialization(detail)) if detail == "unknown zmq message frame"
+        ));
     }
 
     #[tokio::test]
@@ -1709,25 +1696,39 @@ mod tests {
         let state = Arc::new(TokioMutex::new(TransportState::Running));
         let metrics = TransportMetrics::default();
 
-        emit_state_error(&state, &event_tx, &metrics, true, Some(7), "temporary").await;
+        emit_state_error(
+            &state,
+            &event_tx,
+            &metrics,
+            Some(7),
+            TransportError::TemporaryTransport("temporary".to_string()),
+        )
+        .await;
         assert_eq!(*state.lock().await, TransportState::Degraded);
         match event_rx.recv().await {
             Some(RxEvent::Error {
                 request_id: Some(7),
                 status: ReplyStatus::Error,
                 detail,
-            }) => assert!(detail.contains("recoverable I/O error: temporary")),
+            }) => assert!(detail.contains("temporary transport error: temporary")),
             _ => panic!("expected recoverable io error"),
         }
 
-        emit_state_error(&state, &event_tx, &metrics, false, None, "hard-fail").await;
+        emit_state_error(
+            &state,
+            &event_tx,
+            &metrics,
+            None,
+            TransportError::Internal("hard-fail".to_string()),
+        )
+        .await;
         assert_eq!(*state.lock().await, TransportState::Failed);
         match event_rx.recv().await {
             Some(RxEvent::Error {
                 request_id: None,
                 status: ReplyStatus::Error,
                 detail,
-            }) => assert!(detail.contains("fatal I/O error: hard-fail")),
+            }) => assert!(detail.contains("internal transport error: hard-fail")),
             _ => panic!("expected fatal io error"),
         }
     }
@@ -1738,7 +1739,14 @@ mod tests {
         let state = Arc::new(TokioMutex::new(TransportState::Running));
         let metrics = TransportMetrics::default();
 
-        emit_state_error(&state, &event_tx, &metrics, true, None, "temporary").await;
+        emit_state_error(
+            &state,
+            &event_tx,
+            &metrics,
+            None,
+            TransportError::TemporaryTransport("temporary".to_string()),
+        )
+        .await;
         assert_eq!(*state.lock().await, TransportState::Degraded);
 
         emit_transport_recovery(&state).await;
@@ -1863,7 +1871,7 @@ mod tests {
                 status: ReplyStatus::Error,
                 detail,
             }) => {
-                assert!(detail.contains("fatal I/O error"));
+                assert!(detail.contains("internal transport error"));
                 assert!(detail.contains("zeromq initialization failed"));
             }
             _ => panic!("expected fatal io init error event"),
@@ -2016,7 +2024,7 @@ mod tests {
                 detail,
             }) => {
                 assert_eq!(actual, unknown_request_id);
-                assert_eq!(detail, "unexpected reply id");
+                assert_eq!(detail, "internal transport error: unexpected reply id");
             }
             _ => panic!("expected error event for unmatched reply id"),
         }
@@ -2051,7 +2059,7 @@ mod tests {
                 detail,
             }) => {
                 assert_eq!(actual, 11);
-                assert_eq!(detail, "request timed out");
+                assert_eq!(detail, "operation timed out");
             }
             _ => panic!("expected request timeout error"),
         }
@@ -2159,9 +2167,12 @@ mod tests {
         match actor_channels.event_rx.recv().await {
             Some(RxEvent::Error {
                 request_id: Some(actual),
-                status: ReplyStatus::Error,
-                ..
-            }) => assert_eq!(actual, request_id),
+                status: ReplyStatus::Rejected,
+                detail,
+            }) => {
+                assert_eq!(actual, request_id);
+                assert_eq!(detail, "invalid transport state: actor shutting down");
+            }
             _ => panic!("expected error event for shutdown cancellation"),
         }
         assert!(matches!(
@@ -2559,7 +2570,7 @@ mod tests {
                 matches!(
                     event,
                     RxEvent::Error { status: ReplyStatus::Error, detail, .. }
-                        if detail.contains("recoverable I/O error")
+                        if detail.contains("serialization error")
                 )
             })
             .await,
