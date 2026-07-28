@@ -67,10 +67,12 @@ mod tests {
 
     #[test]
     fn non_retryable_errors_are_classified() {
-        assert!(!TransportError::InvalidState {
-            detail: "bad state".to_string(),
-        }
-        .is_retryable());
+        assert!(
+            !TransportError::InvalidState {
+                detail: "bad state".to_string(),
+            }
+            .is_retryable()
+        );
         assert!(!TransportError::Serialization("decode".to_string()).is_retryable());
         assert!(!TransportError::Internal("panic".to_string()).is_retryable());
     }

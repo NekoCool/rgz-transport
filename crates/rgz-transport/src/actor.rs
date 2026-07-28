@@ -257,7 +257,9 @@ impl ActorZmqRuntime {
                                 &tx,
                                 metrics.as_ref(),
                                 InternalIoEvent::IoError {
-                                    error: TransportError::TemporaryTransport(format!("request recv failed: {err}")),
+                                    error: TransportError::TemporaryTransport(format!(
+                                        "request recv failed: {err}"
+                                    )),
                                     request_id: None,
                                 },
                             );
@@ -551,39 +553,45 @@ fn decode_u64_frame(data: &[u8], cursor: &mut usize) -> Option<u64> {
 
 fn decode_incoming_message(message: ZmqMessage) -> Result<InternalIoEvent, TransportError> {
     if message.len() >= 2 {
-        let topic_frame = message
-            .get(0)
-            .ok_or_else(|| TransportError::Serialization("missing publish topic frame".to_string()))?;
+        let topic_frame = message.get(0).ok_or_else(|| {
+            TransportError::Serialization("missing publish topic frame".to_string())
+        })?;
         if let Ok(topic) = String::from_utf8(topic_frame.to_vec()) {
             let payload = message
                 .get(1)
-                .ok_or_else(|| TransportError::Serialization("missing publish payload frame".to_string()))?
+                .ok_or_else(|| {
+                    TransportError::Serialization("missing publish payload frame".to_string())
+                })?
                 .to_vec();
             return Ok(InternalIoEvent::IncomingPublish { topic, payload });
         }
     }
 
-    let data: Vec<u8> = message
-        .try_into()
-        .map_err(|err: &str| TransportError::Serialization(format!("decode zmq message failed: {err}")))?;
+    let data: Vec<u8> = message.try_into().map_err(|err: &str| {
+        TransportError::Serialization(format!("decode zmq message failed: {err}"))
+    })?;
     if data.is_empty() {
-        return Err(TransportError::Serialization("empty zmq message".to_string()));
+        return Err(TransportError::Serialization(
+            "empty zmq message".to_string(),
+        ));
     }
 
     let mut cursor = 0usize;
     match data[0] {
         IO_FRAME_PUBLISH => {
             cursor += 1;
-            let topic_len = decode_u32_frame(&data, &mut cursor)
-                .ok_or_else(|| TransportError::Serialization("invalid publish frame".to_string()))?;
+            let topic_len = decode_u32_frame(&data, &mut cursor).ok_or_else(|| {
+                TransportError::Serialization("invalid publish frame".to_string())
+            })?;
             let topic_end = cursor + topic_len as usize;
             if topic_end > data.len() {
                 return Err(TransportError::Serialization(
                     "invalid publish topic length".to_string(),
                 ));
             }
-            let topic = String::from_utf8(data[cursor..topic_end].to_vec())
-                .map_err(|_| TransportError::Serialization("invalid publish topic utf8".to_string()))?;
+            let topic = String::from_utf8(data[cursor..topic_end].to_vec()).map_err(|_| {
+                TransportError::Serialization("invalid publish topic utf8".to_string())
+            })?;
             cursor = topic_end;
             let payload_len = decode_u32_frame(&data, &mut cursor).ok_or_else(|| {
                 TransportError::Serialization("invalid publish payload length".to_string())
@@ -610,8 +618,9 @@ fn decode_incoming_message(message: ZmqMessage) -> Result<InternalIoEvent, Trans
                     "invalid request topic length".to_string(),
                 ));
             }
-            let topic = String::from_utf8(data[cursor..topic_end].to_vec())
-                .map_err(|_| TransportError::Serialization("invalid request topic utf8".to_string()))?;
+            let topic = String::from_utf8(data[cursor..topic_end].to_vec()).map_err(|_| {
+                TransportError::Serialization("invalid request topic utf8".to_string())
+            })?;
             cursor = topic_end;
             let payload_len = decode_u32_frame(&data, &mut cursor).ok_or_else(|| {
                 TransportError::Serialization("invalid request payload length".to_string())
@@ -634,7 +643,9 @@ fn decode_incoming_message(message: ZmqMessage) -> Result<InternalIoEvent, Trans
             let request_id = decode_u64_frame(&data, &mut cursor)
                 .ok_or_else(|| TransportError::Serialization("invalid reply id".to_string()))?;
             if data.len().saturating_sub(cursor) < 1 {
-                return Err(TransportError::Serialization("invalid reply status".to_string()));
+                return Err(TransportError::Serialization(
+                    "invalid reply status".to_string(),
+                ));
             }
             let status = byte_to_status(data[cursor]);
             cursor += 1;
@@ -2597,13 +2608,17 @@ mod tests {
                 .await
                 .expect("publish command");
             if matches!(
-                recv_until(&mut subscriber.event_rx, Duration::from_millis(150), |event| {
-                    matches!(
-                        event,
-                        RxEvent::IncomingPublish { topic: event_topic, payload, .. }
-                            if event_topic == &topic && payload == b"recovered"
-                    )
-                })
+                recv_until(
+                    &mut subscriber.event_rx,
+                    Duration::from_millis(150),
+                    |event| {
+                        matches!(
+                            event,
+                            RxEvent::IncomingPublish { topic: event_topic, payload, .. }
+                                if event_topic == &topic && payload == b"recovered"
+                        )
+                    }
+                )
                 .await,
                 Some(RxEvent::IncomingPublish { .. })
             ) {

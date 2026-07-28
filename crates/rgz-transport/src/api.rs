@@ -42,8 +42,9 @@ impl Transport {
     pub async fn start(self) -> TransportResult<TransportHandle> {
         let next = {
             let state = self.state.lock().await;
-            transition(*state, TransportEvent::InitRequested)
-                .map_err(|_| TransportError::invalid_transition(*state, TransportEvent::InitRequested))?
+            transition(*state, TransportEvent::InitRequested).map_err(|_| {
+                TransportError::invalid_transition(*state, TransportEvent::InitRequested)
+            })?
         };
 
         {
@@ -361,13 +362,11 @@ mod tests {
         assert_eq!(ok_count, 1);
         assert!(matches!(
             first,
-            Ok(())
-                | Err(TransportError::InvalidState { .. })
+            Ok(()) | Err(TransportError::InvalidState { .. })
         ));
         assert!(matches!(
             second,
-            Ok(())
-                | Err(TransportError::InvalidState { .. })
+            Ok(()) | Err(TransportError::InvalidState { .. })
         ));
 
         assert_eq!(handle.state().await, TransportState::Stopped);
