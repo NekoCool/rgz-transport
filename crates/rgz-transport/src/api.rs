@@ -374,6 +374,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transport_graceful_shutdown_flushes_pending_request_reply() {
+        let transport = Transport::new(TransportConfig::default());
+        let handle = transport.start().await.expect("start transport");
+        let request = handle
+            .request("svc/echo", b"ping".to_vec(), None, Some(500))
+            .await
+            .expect("queue request");
+
+        assert!(matches!(
+            handle.next_event().await,
+            Some(RxEvent::IncomingRequest { request_id, .. }) if request_id == request.request_id
+        ));
+
+        let shutdown = handle.shutdown_with(true, Some(500));
+        let reply = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            handle
+                .reply(request.request_id, b"pong".to_vec(), ReplyStatus::Ok)
+                .await
+        };
+        let (shutdown_result, reply_result) = tokio::join!(shutdown, reply);
+
+        assert_eq!(reply_result, Ok(()));
+        assert_eq!(shutdown_result, Ok(()));
+        assert_eq!(handle.state().await, TransportState::Stopped);
+    }
+
+    #[tokio::test]
     async fn publish_returns_node_busy_when_command_queue_is_full() {
         let (command_tx, _command_rx) = mpsc::channel(1);
         command_tx
