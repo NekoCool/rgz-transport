@@ -93,6 +93,10 @@ impl ActorZmqConfig {
 }
 
 struct ActorZmqRuntime {
+    // The actor owns this mutable snapshot. Connect/disconnect rebuilds sockets from it so
+    // socket halves and receive tasks never outlive the endpoint configuration that created them.
+    config: ActorZmqConfig,
+    subscriptions: HashSet<String>,
     publisher: Option<PubSocket>,
     sub_cmd_tx: Option<mpsc::Sender<SubControlCommand>>,
     request_send: Option<DealerSendHalf>,
@@ -109,6 +113,8 @@ impl ActorZmqRuntime {
         if !config.enabled {
             let (_, io_event_rx) = mpsc::channel(1);
             return Ok(Self {
+                config: config.clone(),
+                subscriptions: HashSet::new(),
                 publisher: None,
                 sub_cmd_tx: None,
                 request_send: None,
@@ -263,6 +269,8 @@ impl ActorZmqRuntime {
         }
 
         Ok(Self {
+            config: config.clone(),
+            subscriptions: HashSet::new(),
             publisher,
             sub_cmd_tx,
             request_send,
@@ -282,7 +290,56 @@ impl ActorZmqRuntime {
         if let Some(handle) = self.req_task.take() {
             handle.abort();
         }
+        self.publisher = None;
+        self.request_send = None;
     }
+
+    fn connect_endpoint(&mut self, endpoint: &str) {
+        add_endpoint(&mut self.config.pub_connect, endpoint);
+        add_endpoint(&mut self.config.sub_connect, endpoint);
+        add_endpoint(&mut self.config.req_connect, endpoint);
+    }
+
+    fn disconnect_endpoint(&mut self, endpoint: &str) {
+        remove_endpoint(&mut self.config.pub_connect, endpoint);
+        remove_endpoint(&mut self.config.sub_connect, endpoint);
+        remove_endpoint(&mut self.config.req_connect, endpoint);
+    }
+
+    fn is_active(&self) -> bool {
+        self.request_send.is_some() || self.sub_cmd_tx.is_some() || self.publisher.is_some()
+    }
+
+    /// Recreate all live sockets after an endpoint change, then restore subscriptions before
+    /// normal traffic resumes. Rebuilding as one unit keeps PUB/SUB/DEALER lifecycle aligned.
+    async fn rebuild(&mut self, metrics: Arc<TransportMetrics>) -> Result<(), String> {
+        let config = self.config.clone();
+        let subscriptions = self.subscriptions.clone();
+        self.stop().await;
+        let mut replacement = Self::initialize(&config, metrics).await?;
+
+        if let Some(sub_cmd_tx) = replacement.sub_cmd_tx.as_ref() {
+            for topic in subscriptions {
+                sub_cmd_tx
+                    .send(SubControlCommand::Subscribe(topic))
+                    .await
+                    .map_err(|err| format!("failed to restore subscription: {err}"))?;
+            }
+        }
+        replacement.subscriptions = self.subscriptions.clone();
+        *self = replacement;
+        Ok(())
+    }
+}
+
+fn add_endpoint(endpoints: &mut Vec<String>, endpoint: &str) {
+    if !endpoints.iter().any(|candidate| candidate == endpoint) {
+        endpoints.push(endpoint.to_string());
+    }
+}
+
+fn remove_endpoint(endpoints: &mut Vec<String>, endpoint: &str) {
+    endpoints.retain(|candidate| candidate != endpoint);
 }
 
 fn try_emit_io_event(
@@ -692,7 +749,7 @@ pub enum TxCmd {
         topic: String,
     },
 
-    /// Connect to an adapter endpoint.
+    /// Connect to an adapter endpoint by rebuilding the affected ZeroMQ runtime.
     Connect {
         /// Endpoint string for the adapter.
         endpoint: String,
@@ -700,7 +757,7 @@ pub enum TxCmd {
         namespace: Option<String>,
     },
 
-    /// Disconnect from a connected endpoint.
+    /// Disconnect from an endpoint by stopping and rebuilding the affected ZeroMQ runtime.
     Disconnect {
         /// Endpoint string to disconnect from.
         endpoint: String,
@@ -949,14 +1006,10 @@ impl TransportActor {
         let inbound_requests: Arc<Mutex<HashSet<RequestId>>> = Arc::new(Mutex::new(HashSet::new()));
         let mut command_open = true;
         let mut control_open = true;
-        let io_runtime_active = io_runtime.request_send.is_some()
-            || io_runtime.sub_cmd_tx.is_some()
-            || io_runtime.publisher.is_some();
-
         while command_open || control_open {
             tokio::select! {
                 biased;
-                io_event = io_runtime.io_event_rx.recv(), if io_runtime_active => {
+                io_event = io_runtime.io_event_rx.recv(), if io_runtime.is_active() => {
                     match io_event {
                         Some(InternalIoEvent::IncomingPublish { topic, payload }) => {
                             try_emit_event(
@@ -1346,10 +1399,12 @@ impl TransportActor {
                                     )
                                     .await;
                                 } else {
+                                    io_runtime.subscriptions.insert(topic.clone());
                                     emit_transport_recovery(&state).await;
                                     try_emit_event(&event_tx, metrics.as_ref(), RxEvent::Subscribed { topic });
                                 }
                             } else {
+                                io_runtime.subscriptions.insert(topic.clone());
                                 try_emit_event(&event_tx, metrics.as_ref(), RxEvent::Subscribed { topic });
                             }
                         }
@@ -1372,18 +1427,50 @@ impl TransportActor {
                                     )
                                     .await;
                                 } else {
+                                    io_runtime.subscriptions.remove(&topic);
                                     emit_transport_recovery(&state).await;
                                     try_emit_event(&event_tx, metrics.as_ref(), RxEvent::Unsubscribed { topic });
                                 }
                             } else {
+                                io_runtime.subscriptions.remove(&topic);
                                 try_emit_event(&event_tx, metrics.as_ref(), RxEvent::Unsubscribed { topic });
                             }
                         }
                         Some(TxCmd::Connect { endpoint, namespace: _ }) => {
-                            try_emit_event(&event_tx, metrics.as_ref(), RxEvent::Connected { endpoint });
-                            emit_transport_recovery(&state).await;
+                            io_runtime.connect_endpoint(&endpoint);
+                            match io_runtime.rebuild(Arc::clone(&metrics)).await {
+                                Ok(()) => {
+                                    try_emit_event(&event_tx, metrics.as_ref(), RxEvent::Connected { endpoint });
+                                    emit_transport_recovery(&state).await;
+                                }
+                                Err(err) => {
+                                    emit_state_error(
+                                        &state,
+                                        &event_tx,
+                                        metrics.as_ref(),
+                                        None,
+                                        TransportError::TemporaryTransport(format!(
+                                            "reconnect failed: {err}"
+                                        )),
+                                    )
+                                    .await;
+                                }
+                            }
                         }
                         Some(TxCmd::Disconnect { endpoint, reason }) => {
+                            io_runtime.disconnect_endpoint(&endpoint);
+                            if let Err(err) = io_runtime.rebuild(Arc::clone(&metrics)).await {
+                                emit_state_error(
+                                    &state,
+                                    &event_tx,
+                                    metrics.as_ref(),
+                                    None,
+                                    TransportError::TemporaryTransport(format!(
+                                        "disconnect failed: {err}"
+                                    )),
+                                )
+                                .await;
+                            }
                             try_emit_event(
                                 &event_tx,
                                 metrics.as_ref(),
@@ -2423,6 +2510,252 @@ mod tests {
             timeout(Duration::from_secs(2), ack_rx2).await,
             Ok(Ok(Ok(())))
         ));
+    }
+
+    #[cfg(feature = "network-tests")]
+    #[tokio::test]
+    #[ignore = "requires zeromq bind/connect permissions"]
+    async fn zeromq_pub_sub_disconnect_then_reconnect_recovers_delivery() {
+        let endpoint = next_tcp_endpoint();
+        let pub_config = TransportConfig {
+            enable_zeromq_io: true,
+            zeromq_pub_bind: Some(endpoint.clone()),
+            ..TransportConfig::default()
+        };
+        let sub_config = TransportConfig {
+            enable_zeromq_io: true,
+            zeromq_sub_connect: vec![endpoint.clone()],
+            ..TransportConfig::default()
+        };
+
+        let (publisher, publisher_state) = spawn_with_config(pub_config).await;
+        sleep(Duration::from_millis(200)).await;
+        let (mut subscriber, subscriber_state) = spawn_with_config(sub_config).await;
+        sleep(Duration::from_millis(200)).await;
+        if *publisher_state.lock().await == TransportState::Failed
+            || *subscriber_state.lock().await == TransportState::Failed
+        {
+            eprintln!("skipping: zeromq bind/connect not permitted in this environment");
+            return;
+        }
+
+        let topic = "telemetry/reconnect".to_string();
+        subscriber
+            .command_tx
+            .send(TxCmd::Subscribe {
+                topic: topic.clone(),
+            })
+            .await
+            .expect("subscribe command");
+        let _ = recv_until(&mut subscriber.event_rx, Duration::from_secs(1), |event| {
+            matches!(event, RxEvent::Subscribed { topic: event_topic } if event_topic == &topic)
+        })
+        .await;
+
+        subscriber
+            .command_tx
+            .send(TxCmd::Disconnect {
+                endpoint: endpoint.clone(),
+                reason: Some("test reconnect".to_string()),
+            })
+            .await
+            .expect("disconnect command");
+        assert!(matches!(
+            recv_until(&mut subscriber.event_rx, Duration::from_secs(2), |event| {
+                matches!(event, RxEvent::Disconnected { endpoint: event_endpoint, .. } if event_endpoint == &endpoint)
+            })
+            .await,
+            Some(RxEvent::Disconnected { .. })
+        ));
+
+        subscriber
+            .command_tx
+            .send(TxCmd::Connect {
+                endpoint: endpoint.clone(),
+                namespace: None,
+            })
+            .await
+            .expect("connect command");
+        assert!(matches!(
+            recv_until(&mut subscriber.event_rx, Duration::from_secs(2), |event| {
+                matches!(event, RxEvent::Connected { endpoint: event_endpoint } if event_endpoint == &endpoint)
+            })
+            .await,
+            Some(RxEvent::Connected { .. })
+        ));
+
+        sleep(Duration::from_millis(200)).await;
+        let mut delivered = false;
+        for _ in 0..20 {
+            publisher
+                .command_tx
+                .send(TxCmd::Publish {
+                    topic: topic.clone(),
+                    payload: b"recovered".to_vec(),
+                    headers: None,
+                })
+                .await
+                .expect("publish command");
+            if matches!(
+                recv_until(&mut subscriber.event_rx, Duration::from_millis(150), |event| {
+                    matches!(
+                        event,
+                        RxEvent::IncomingPublish { topic: event_topic, payload, .. }
+                            if event_topic == &topic && payload == b"recovered"
+                    )
+                })
+                .await,
+                Some(RxEvent::IncomingPublish { .. })
+            ) {
+                delivered = true;
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        assert!(delivered, "message was not delivered after reconnect");
+
+        for channels in [&publisher, &subscriber] {
+            let (ack_tx, ack_rx) = oneshot::channel();
+            channels
+                .control_tx
+                .send(TxCmd::Shutdown {
+                    graceful: false,
+                    timeout_ms: None,
+                    ack: ack_tx,
+                })
+                .await
+                .expect("shutdown command");
+            assert!(matches!(
+                timeout(Duration::from_secs(2), ack_rx).await,
+                Ok(Ok(Ok(())))
+            ));
+        }
+    }
+
+    #[cfg(feature = "network-tests")]
+    #[tokio::test]
+    #[ignore = "requires zeromq bind/connect permissions"]
+    async fn zeromq_request_reply_disconnect_then_reconnect_recovers_delivery() {
+        let endpoint = next_tcp_endpoint();
+        let server_config = TransportConfig {
+            enable_zeromq_io: true,
+            zeromq_req_bind: Some(endpoint.clone()),
+            ..TransportConfig::default()
+        };
+        let client_config = TransportConfig {
+            enable_zeromq_io: true,
+            zeromq_req_connect: vec![endpoint.clone()],
+            ..TransportConfig::default()
+        };
+
+        let (mut server, server_state) = spawn_with_config(server_config).await;
+        sleep(Duration::from_millis(200)).await;
+        let (mut client, client_state) = spawn_with_config(client_config).await;
+        sleep(Duration::from_millis(200)).await;
+        if *server_state.lock().await == TransportState::Failed
+            || *client_state.lock().await == TransportState::Failed
+        {
+            eprintln!("skipping: zeromq bind/connect not permitted in this environment");
+            return;
+        }
+
+        client
+            .command_tx
+            .send(TxCmd::Disconnect {
+                endpoint: endpoint.clone(),
+                reason: Some("test reconnect".to_string()),
+            })
+            .await
+            .expect("disconnect command");
+        assert!(matches!(
+            recv_until(&mut client.event_rx, Duration::from_secs(2), |event| {
+                matches!(event, RxEvent::Disconnected { endpoint: event_endpoint, .. } if event_endpoint == &endpoint)
+            })
+            .await,
+            Some(RxEvent::Disconnected { .. })
+        ));
+
+        client
+            .command_tx
+            .send(TxCmd::Connect {
+                endpoint: endpoint.clone(),
+                namespace: None,
+            })
+            .await
+            .expect("connect command");
+        assert!(matches!(
+            recv_until(&mut client.event_rx, Duration::from_secs(2), |event| {
+                matches!(event, RxEvent::Connected { endpoint: event_endpoint } if event_endpoint == &endpoint)
+            })
+            .await,
+            Some(RxEvent::Connected { .. })
+        ));
+
+        let request_id = 9002u64;
+        client
+            .command_tx
+            .send(TxCmd::SendRequest {
+                request: TxRequest {
+                    request_id,
+                    topic: "svc/reconnect".to_string(),
+                    payload: b"ping".to_vec(),
+                    headers: None,
+                    timeout_ms: Some(1_000),
+                },
+            })
+            .await
+            .expect("request command");
+        assert!(matches!(
+            recv_until(&mut server.event_rx, Duration::from_secs(2), |event| {
+                matches!(
+                    event,
+                    RxEvent::IncomingRequest { request_id: event_id, .. } if *event_id == request_id
+                )
+            })
+            .await,
+            Some(RxEvent::IncomingRequest { .. })
+        ));
+
+        server
+            .command_tx
+            .send(TxCmd::SendReply {
+                reply: TxReply {
+                    request_id,
+                    payload: b"pong".to_vec(),
+                    status: ReplyStatus::Ok,
+                    headers: None,
+                },
+            })
+            .await
+            .expect("reply command");
+        assert!(matches!(
+            recv_until(&mut client.event_rx, Duration::from_secs(2), |event| {
+                matches!(
+                    event,
+                    RxEvent::IncomingReply { request_id: event_id, payload, status, .. }
+                        if *event_id == request_id && payload == b"pong" && *status == ReplyStatus::Ok
+                )
+            })
+            .await,
+            Some(RxEvent::IncomingReply { .. })
+        ));
+
+        for channels in [&server, &client] {
+            let (ack_tx, ack_rx) = oneshot::channel();
+            channels
+                .control_tx
+                .send(TxCmd::Shutdown {
+                    graceful: false,
+                    timeout_ms: None,
+                    ack: ack_tx,
+                })
+                .await
+                .expect("shutdown command");
+            assert!(matches!(
+                timeout(Duration::from_secs(2), ack_rx).await,
+                Ok(Ok(Ok(())))
+            ));
+        }
     }
 
     #[cfg(feature = "network-tests")]
