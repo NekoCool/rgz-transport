@@ -6,15 +6,15 @@ use rgz_transport::{
 fn issue23_invalid_transition_is_rejected() {
     assert!(matches!(
         transition(TransportState::Stopped, TransportEvent::StartOk),
-        Err(TransportError::InvalidTransition { .. })
+        Err(TransportError::InvalidState { .. })
     ));
     assert!(matches!(
         transition(TransportState::Stopped, TransportEvent::ShutdownComplete),
-        Err(TransportError::InvalidTransition { .. })
+        Err(TransportError::InvalidState { .. })
     ));
     assert!(matches!(
         transition(TransportState::Created, TransportEvent::StartOk),
-        Err(TransportError::InvalidTransition { .. })
+        Err(TransportError::InvalidState { .. })
     ));
 }
 
@@ -29,7 +29,7 @@ fn issue23_rejected_transition_does_not_change_state() {
     let original = model;
     assert!(matches!(
         model.apply(TransportEvent::StartOk, 100),
-        Err(TransportError::InvalidTransition { .. })
+        Err(TransportError::InvalidState { .. })
     ));
     assert_eq!(model, original);
 }
@@ -144,7 +144,7 @@ fn issue23_transition_matrix_forbidden_transitions() {
         assert!(
             matches!(
                 transition(from, event),
-                Err(TransportError::InvalidTransition { .. })
+                Err(TransportError::InvalidState { .. })
             ),
             "{from:?} -> {event:?} should be forbidden"
         );
@@ -165,7 +165,7 @@ fn issue23_state_model_rejects_forbidden_transitions_without_mutating_state() {
         assert!(
             matches!(
                 model.apply(event, 1234),
-                Err(TransportError::InvalidTransition { .. })
+                Err(TransportError::InvalidState { .. })
             ),
             "{state:?} -> {event:?} should be invalid"
         );

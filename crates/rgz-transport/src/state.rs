@@ -139,7 +139,7 @@ impl StateModel {
             }
             (Stopping, ShutdownComplete) => Stopped,
             (state, event) => {
-                return Err(TransportError::InvalidTransition { from: state, event });
+                return Err(TransportError::invalid_transition(state, event));
             }
         };
 
@@ -239,7 +239,7 @@ pub fn transition(
         (Degraded, ShutdownRequested) => Stopping,
         (Failed, ShutdownRequested) => Stopping,
         (Stopping, ShutdownComplete) => Stopped,
-        (state, event) => return Err(TransportError::InvalidTransition { from: state, event }),
+        (state, event) => return Err(TransportError::invalid_transition(state, event)),
     };
 
     Ok(next)
@@ -288,15 +288,15 @@ mod tests {
     fn invalid_transitions_are_rejected() {
         assert!(matches!(
             super::transition(Stopped, StartOk),
-            Err(TransportError::InvalidTransition { .. })
+            Err(TransportError::InvalidState { .. })
         ));
         assert!(matches!(
             super::transition(Created, StartErr),
-            Err(TransportError::InvalidTransition { .. })
+            Err(TransportError::InvalidState { .. })
         ));
         assert!(matches!(
             super::transition(Failed, StartOk),
-            Err(TransportError::InvalidTransition { .. })
+            Err(TransportError::InvalidState { .. })
         ));
     }
 
