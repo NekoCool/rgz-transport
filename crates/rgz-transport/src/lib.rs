@@ -4,6 +4,7 @@ pub mod actor;
 pub mod api;
 pub mod config;
 pub mod error;
+mod legacy_pubsub;
 pub mod metrics;
 pub mod state;
 pub mod transport;

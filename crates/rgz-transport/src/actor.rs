@@ -17,6 +17,7 @@ use tokio::time::{Duration, Instant, sleep, sleep_until};
 
 use crate::config::TransportConfig;
 use crate::error::{TransportError, TransportResult};
+use crate::legacy_pubsub;
 use crate::metrics::TransportMetrics;
 use crate::state::{TransportEvent, TransportState, transition};
 use tracing::warn;
@@ -482,11 +483,18 @@ fn encode_publish_frame(topic: &str, payload: &[u8]) -> Result<Vec<u8>, Transpor
     Ok(frame)
 }
 
-fn encode_publish_message(topic: &str, payload: &[u8]) -> Result<ZmqMessage, TransportError> {
+fn encode_publish_message(
+    topic: &str,
+    payload: &[u8],
+    headers: Option<&MessageHeaders>,
+) -> Result<ZmqMessage, TransportError> {
     if topic.is_empty() {
         return Err(TransportError::Serialization(
             "publish topic is empty".to_string(),
         ));
+    }
+    if let Some(message) = legacy_pubsub::encode_if_configured(topic, payload, headers)? {
+        return Ok(message);
     }
     let mut message: ZmqMessage = topic.to_string().into();
     message.push_back(payload.to_vec().into());
@@ -552,6 +560,14 @@ fn decode_u64_frame(data: &[u8], cursor: &mut usize) -> Option<u64> {
 }
 
 fn decode_incoming_message(message: ZmqMessage) -> Result<InternalIoEvent, TransportError> {
+    if message.len() == 4 {
+        let publication = legacy_pubsub::decode(&message)?;
+        return Ok(InternalIoEvent::IncomingPublish {
+            topic: publication.topic,
+            payload: publication.payload,
+        });
+    }
+
     if message.len() >= 2 {
         let topic_frame = message.get(0).ok_or_else(|| {
             TransportError::Serialization("missing publish topic frame".to_string())
@@ -1145,7 +1161,7 @@ impl TransportActor {
                         }) => {
                             let mut sent = false;
                             if let Some(publisher) = io_runtime.publisher.as_mut() {
-                                match encode_publish_message(&topic, &payload) {
+                                match encode_publish_message(&topic, &payload, headers.as_ref()) {
                                     Ok(message) => match publisher.send(message).await {
                                         Ok(_) => {
                                             emit_transport_recovery(&state).await;
@@ -1728,6 +1744,53 @@ mod tests {
             }
             _ => panic!("expected publish event"),
         }
+    }
+
+    #[test]
+    fn legacy_pub_sub_fixture_decodes_to_internal_event() {
+        let mut message: ZmqMessage = "@/demo@/chatter".into();
+        message.push_back("tcp://192.0.2.10:34567".into());
+        message.push_back(vec![0x0a, 0x02, b'o', b'k'].into());
+        message.push_back("gz.msgs.StringMsg".into());
+
+        let event = decode_incoming_message(message).expect("decode legacy publish");
+        match event {
+            InternalIoEvent::IncomingPublish { topic, payload } => {
+                assert_eq!(topic, "@/demo@/chatter");
+                assert_eq!(payload, vec![0x0a, 0x02, b'o', b'k']);
+            }
+            _ => panic!("expected publish event"),
+        }
+    }
+
+    #[test]
+    fn legacy_publish_metadata_encodes_four_frames() {
+        let headers = MessageHeaders::from([
+            (
+                "rgz.publisher.address".to_string(),
+                "tcp://192.0.2.10:34567".to_string(),
+            ),
+            (
+                "rgz.message.type".to_string(),
+                "gz.msgs.StringMsg".to_string(),
+            ),
+        ]);
+
+        let message =
+            encode_publish_message("@/demo@/chatter", &[0x0a, 0x02, b'o', b'k'], Some(&headers))
+                .expect("encode legacy publish");
+
+        assert_eq!(message.len(), 4);
+        assert_eq!(message.get(0).expect("topic").to_vec(), b"@/demo@/chatter");
+        assert_eq!(
+            message.get(1).expect("address").to_vec(),
+            b"tcp://192.0.2.10:34567"
+        );
+        assert_eq!(
+            message.get(2).expect("payload").to_vec(),
+            [0x0a, 0x02, b'o', b'k']
+        );
+        assert_eq!(message.get(3).expect("type").to_vec(), b"gz.msgs.StringMsg");
     }
 
     #[test]
