@@ -1733,6 +1733,21 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "network-tests")]
+    async fn shutdown_test_actor(actor: &TestActorChannels) {
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        actor
+            .control_tx
+            .send(TxCmd::Shutdown {
+                graceful: false,
+                timeout_ms: None,
+                ack: ack_tx,
+            })
+            .await
+            .expect("send shutdown");
+        assert!(matches!(ack_rx.await, Ok(Ok(()))));
+    }
+
     #[test]
     fn io_frame_publish_roundtrip_decodes_to_internal_event() {
         let frame = encode_publish_frame("telemetry/temp", b"42").expect("publish frame");
@@ -2584,6 +2599,132 @@ mod tests {
             timeout(Duration::from_secs(2), ack_rx2).await,
             Ok(Ok(Ok(())))
         ));
+    }
+
+    #[cfg(feature = "network-tests")]
+    #[tokio::test]
+    #[ignore = "requires zeromq bind/connect permissions"]
+    async fn new_publisher_delivers_legacy_multipart_layout() {
+        let endpoint = next_tcp_endpoint();
+        let config = TransportConfig {
+            enable_zeromq_io: true,
+            zeromq_pub_bind: Some(endpoint.clone()),
+            ..TransportConfig::default()
+        };
+        let (publisher, state) = spawn_with_config(config).await;
+        sleep(Duration::from_millis(200)).await;
+        if *state.lock().await == TransportState::Failed {
+            eprintln!("skipping: zeromq bind/connect not permitted in this environment");
+            return;
+        }
+
+        let mut legacy_subscriber = SubSocket::new();
+        legacy_subscriber
+            .connect(&endpoint)
+            .await
+            .expect("connect legacy subscriber");
+        legacy_subscriber
+            .subscribe("@/demo@/chatter")
+            .await
+            .expect("subscribe legacy topic");
+        sleep(Duration::from_millis(200)).await;
+
+        let headers = MessageHeaders::from([
+            ("rgz.publisher.address".to_string(), endpoint.clone()),
+            (
+                "rgz.message.type".to_string(),
+                "gz.msgs.StringMsg".to_string(),
+            ),
+        ]);
+        publisher
+            .command_tx
+            .send(TxCmd::Publish {
+                topic: "@/demo@/chatter".to_string(),
+                payload: vec![0x0a, 0x02, b'o', b'k'],
+                headers: Some(headers),
+            })
+            .await
+            .expect("publish legacy layout");
+
+        let message = timeout(Duration::from_secs(1), legacy_subscriber.recv())
+            .await
+            .expect("legacy subscriber timed out")
+            .expect("legacy subscriber receive");
+        assert_eq!(message.len(), 4);
+        assert_eq!(message.get(0).expect("topic").to_vec(), b"@/demo@/chatter");
+        assert_eq!(
+            message.get(1).expect("address").to_vec(),
+            endpoint.as_bytes()
+        );
+        assert_eq!(
+            message.get(2).expect("payload").to_vec(),
+            [0x0a, 0x02, b'o', b'k']
+        );
+        assert_eq!(message.get(3).expect("type").to_vec(), b"gz.msgs.StringMsg");
+
+        shutdown_test_actor(&publisher).await;
+    }
+
+    #[cfg(feature = "network-tests")]
+    #[tokio::test]
+    #[ignore = "requires zeromq bind/connect permissions"]
+    async fn legacy_multipart_layout_delivers_to_new_subscriber() {
+        let endpoint = next_tcp_endpoint();
+        let mut legacy_publisher = PubSocket::new();
+        if let Err(error) = legacy_publisher.bind(&endpoint).await {
+            eprintln!("skipping: zeromq bind/connect not permitted in this environment: {error}");
+            return;
+        }
+
+        let config = TransportConfig {
+            enable_zeromq_io: true,
+            zeromq_sub_connect: vec![endpoint.clone()],
+            ..TransportConfig::default()
+        };
+        let (mut subscriber, state) = spawn_with_config(config).await;
+        sleep(Duration::from_millis(200)).await;
+        if *state.lock().await == TransportState::Failed {
+            eprintln!("skipping: zeromq bind/connect not permitted in this environment");
+            return;
+        }
+
+        subscriber
+            .command_tx
+            .send(TxCmd::Subscribe {
+                topic: "@/demo@/chatter".to_string(),
+            })
+            .await
+            .expect("subscribe new actor");
+        assert!(matches!(
+            recv_until(&mut subscriber.event_rx, Duration::from_secs(1), |event| {
+                matches!(event, RxEvent::Subscribed { topic } if topic == "@/demo@/chatter")
+            })
+            .await,
+            Some(RxEvent::Subscribed { .. })
+        ));
+        sleep(Duration::from_millis(200)).await;
+
+        let mut message: ZmqMessage = "@/demo@/chatter".into();
+        message.push_back(endpoint.clone().into());
+        message.push_back(vec![0x0a, 0x02, b'o', b'k'].into());
+        message.push_back("gz.msgs.StringMsg".into());
+        legacy_publisher
+            .send(message)
+            .await
+            .expect("legacy publish");
+
+        let event = recv_until(&mut subscriber.event_rx, Duration::from_secs(1), |event| {
+            matches!(
+                event,
+                RxEvent::IncomingPublish { topic, payload, .. }
+                    if topic == "@/demo@/chatter" && payload == &vec![0x0a, 0x02, b'o', b'k']
+            )
+        })
+        .await
+        .expect("new subscriber receive legacy publication");
+        assert!(matches!(event, RxEvent::IncomingPublish { .. }));
+
+        shutdown_test_actor(&subscriber).await;
     }
 
     #[cfg(feature = "network-tests")]
