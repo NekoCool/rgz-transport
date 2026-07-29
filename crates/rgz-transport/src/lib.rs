@@ -16,7 +16,7 @@ pub use actor::{
     bounded_channels, bounded_channels_with_control,
 };
 pub use api::{Transport, TransportHandle};
-pub use config::TransportConfig;
+pub use config::{DiscoveryConfig, TransportConfig};
 pub use error::TransportError;
 pub use metrics::{TransportMetrics, TransportMetricsSnapshot};
 pub use state::{
