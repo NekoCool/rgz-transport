@@ -1,0 +1,74 @@
+{
+  "format_version": 1,
+  "description": "Canonical legacy transport frame and discovery datagram fixtures. Text frames are UTF-8; payload frames are hexadecimal bytes.",
+  "pub_sub": {
+    "frames": [
+      { "utf8": "@/demo@/chatter" },
+      { "utf8": "tcp://192.0.2.10:34567" },
+      { "hex": "0a026f6b" },
+      { "utf8": "gz.msgs.StringMsg" }
+    ]
+  },
+  "service_request": {
+    "frames": [
+      { "utf8": "reply-id" },
+      { "utf8": "@/demo@/echo" },
+      { "utf8": "tcp://192.0.2.20:40000" },
+      { "utf8": "requester-id" },
+      { "utf8": "node-id" },
+      { "utf8": "request-id" },
+      { "hex": "0a026f6b" },
+      { "utf8": "gz.msgs.StringMsg" },
+      { "utf8": "gz.msgs.StringMsg" }
+    ]
+  },
+  "service_reply_success": {
+    "frames": [
+      { "utf8": "requester-id" },
+      { "utf8": "@/demo@/echo" },
+      { "utf8": "node-id" },
+      { "utf8": "request-id" },
+      { "hex": "0a026f6b" },
+      { "utf8": "1" }
+    ]
+  },
+  "service_reply_failure": {
+    "frames": [
+      { "utf8": "requester-id" },
+      { "utf8": "@/demo@/echo" },
+      { "utf8": "node-id" },
+      { "utf8": "request-id" },
+      { "hex": "" },
+      { "utf8": "0" }
+    ]
+  },
+  "discovery_subscribe": {
+    "protobuf_type": "gz.msgs.Discovery",
+    "semantic_value": {
+      "version": 10,
+      "process_uuid": "p1",
+      "type": "SUBSCRIBE",
+      "subscriber_topic": "@/demo@/chatter"
+    },
+    "protobuf_hex": "100a1a027031200232110a0f402f64656d6f402f63686174746572",
+    "udp_datagram_hex": "1b00100a1a027031200232110a0f402f64656d6f402f63686174746572"
+  },
+  "discovery_advertise_message": {
+    "protobuf_type": "gz.msgs.Discovery",
+    "semantic_value": {
+      "version": 10,
+      "process_uuid": "proc-1",
+      "type": "ADVERTISE",
+      "publisher": {
+        "topic": "@/demo@/chatter",
+        "address": "tcp://192.0.2.10:34567",
+        "process_uuid": "proc-1",
+        "node_uuid": "node-1",
+        "scope": "ALL",
+        "message_type": "gz.msgs.StringMsg"
+      }
+    },
+    "protobuf_hex": "100a1a0670726f632d3120013a500a0f402f64656d6f402f6368617474657212167463703a2f2f3139322e302e322e31303a33343536371a0670726f632d3122066e6f64652d31280232131211677a2e6d7367732e537472696e674d7367",
+    "udp_datagram_hex": "5e00100a1a0670726f632d3120013a500a0f402f64656d6f402f6368617474657212167463703a2f2f3139322e302e322e31303a33343536371a0670726f632d3122066e6f64652d31280232131211677a2e6d7367732e537472696e674d7367"
+  }
+}

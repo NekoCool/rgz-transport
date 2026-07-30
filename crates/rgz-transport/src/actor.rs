@@ -16,9 +16,12 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant, sleep, sleep_until};
 
 use crate::config::TransportConfig;
+use crate::discovery::{DiscoveryEvent, DiscoveryRuntime};
 use crate::error::{TransportError, TransportResult};
+use crate::legacy_pubsub;
 use crate::metrics::TransportMetrics;
 use crate::state::{TransportEvent, TransportState, transition};
+use rgz_msgs::discovery::publisher::PubType;
 use tracing::warn;
 use zeromq::{DealerSendHalf, DealerSocket, PubSocket, SubSocket, ZmqMessage, prelude::*};
 
@@ -38,6 +41,7 @@ const IO_FRAME_REPLY: u8 = 0x03;
 
 #[derive(Debug)]
 enum InternalIoEvent {
+    Discovery(DiscoveryEvent),
     IncomingPublish {
         topic: String,
         payload: MessagePayload,
@@ -75,6 +79,7 @@ struct ActorZmqConfig {
     sub_connect: Vec<String>,
     req_bind: Option<String>,
     req_connect: Vec<String>,
+    discovery: crate::config::DiscoveryConfig,
 }
 
 impl ActorZmqConfig {
@@ -88,6 +93,7 @@ impl ActorZmqConfig {
             sub_connect: config.zeromq_sub_connect.clone(),
             req_bind: config.zeromq_req_bind.clone(),
             req_connect: config.zeromq_req_connect.clone(),
+            discovery: config.discovery.clone(),
         }
     }
 }
@@ -103,6 +109,8 @@ struct ActorZmqRuntime {
     io_event_rx: mpsc::Receiver<InternalIoEvent>,
     sub_task: Option<JoinHandle<()>>,
     req_task: Option<JoinHandle<()>>,
+    discovery_runtime: Option<DiscoveryRuntime>,
+    discovery_task: Option<JoinHandle<()>>,
 }
 
 impl ActorZmqRuntime {
@@ -121,6 +129,8 @@ impl ActorZmqRuntime {
                 io_event_rx,
                 sub_task: None,
                 req_task: None,
+                discovery_runtime: None,
+                discovery_task: None,
             });
         }
 
@@ -178,6 +188,18 @@ impl ActorZmqRuntime {
         let mut sub_task = None;
         let mut sub_cmd_tx = None;
         let mut req_task = None;
+        let (discovery_tx, mut discovery_rx) = mpsc::channel(64);
+        let discovery_runtime = DiscoveryRuntime::start(&config.discovery, discovery_tx)
+            .await
+            .map_err(|error| error.to_string())?;
+        let tx = io_event_tx.clone();
+        let discovery_task = tokio::spawn(async move {
+            while let Some(event) = discovery_rx.recv().await {
+                if tx.send(InternalIoEvent::Discovery(event)).await.is_err() {
+                    return;
+                }
+            }
+        });
 
         if let Some(mut socket) = subscriber.take() {
             let tx = io_event_tx.clone();
@@ -279,6 +301,8 @@ impl ActorZmqRuntime {
             io_event_rx,
             sub_task,
             req_task,
+            discovery_runtime: Some(discovery_runtime),
+            discovery_task: Some(discovery_task),
         })
     }
 
@@ -291,6 +315,12 @@ impl ActorZmqRuntime {
         }
         if let Some(handle) = self.req_task.take() {
             handle.abort();
+        }
+        if let Some(handle) = self.discovery_task.take() {
+            handle.abort();
+        }
+        if let Some(runtime) = self.discovery_runtime.take() {
+            runtime.stop().await;
         }
         self.publisher = None;
         self.request_send = None;
@@ -334,14 +364,19 @@ impl ActorZmqRuntime {
     }
 }
 
-fn add_endpoint(endpoints: &mut Vec<String>, endpoint: &str) {
+fn add_endpoint(endpoints: &mut Vec<String>, endpoint: &str) -> bool {
     if !endpoints.iter().any(|candidate| candidate == endpoint) {
         endpoints.push(endpoint.to_string());
+        true
+    } else {
+        false
     }
 }
 
-fn remove_endpoint(endpoints: &mut Vec<String>, endpoint: &str) {
+fn remove_endpoint(endpoints: &mut Vec<String>, endpoint: &str) -> bool {
+    let initial_len = endpoints.len();
     endpoints.retain(|candidate| candidate != endpoint);
+    endpoints.len() != initial_len
 }
 
 fn try_emit_io_event(
@@ -482,11 +517,18 @@ fn encode_publish_frame(topic: &str, payload: &[u8]) -> Result<Vec<u8>, Transpor
     Ok(frame)
 }
 
-fn encode_publish_message(topic: &str, payload: &[u8]) -> Result<ZmqMessage, TransportError> {
+fn encode_publish_message(
+    topic: &str,
+    payload: &[u8],
+    headers: Option<&MessageHeaders>,
+) -> Result<ZmqMessage, TransportError> {
     if topic.is_empty() {
         return Err(TransportError::Serialization(
             "publish topic is empty".to_string(),
         ));
+    }
+    if let Some(message) = legacy_pubsub::encode_if_configured(topic, payload, headers)? {
+        return Ok(message);
     }
     let mut message: ZmqMessage = topic.to_string().into();
     message.push_back(payload.to_vec().into());
@@ -552,6 +594,14 @@ fn decode_u64_frame(data: &[u8], cursor: &mut usize) -> Option<u64> {
 }
 
 fn decode_incoming_message(message: ZmqMessage) -> Result<InternalIoEvent, TransportError> {
+    if message.len() == 4 {
+        let publication = legacy_pubsub::decode(&message)?;
+        return Ok(InternalIoEvent::IncomingPublish {
+            topic: publication.topic,
+            payload: publication.payload,
+        });
+    }
+
     if message.len() >= 2 {
         let topic_frame = message.get(0).ok_or_else(|| {
             TransportError::Serialization("missing publish topic frame".to_string())
@@ -994,6 +1044,10 @@ impl TransportActor {
                         sub_connect: Vec::new(),
                         req_bind: None,
                         req_connect: Vec::new(),
+                        discovery: crate::config::DiscoveryConfig {
+                            enabled: false,
+                            ..config.discovery.clone()
+                        },
                     },
                     Arc::clone(&metrics),
                 )
@@ -1022,6 +1076,33 @@ impl TransportActor {
                 biased;
                 io_event = io_runtime.io_event_rx.recv(), if io_runtime.is_active() => {
                     match io_event {
+                        Some(InternalIoEvent::Discovery(DiscoveryEvent::DecodeError(detail))) => {
+                            emit_state_error(
+                                &state,
+                                &event_tx,
+                                metrics.as_ref(),
+                                None,
+                                TransportError::TemporaryTransport(detail),
+                            )
+                            .await;
+                        }
+                        Some(InternalIoEvent::Discovery(DiscoveryEvent::PublisherAdvertised(publisher))) => {
+                            if matches!(publisher.pub_type, Some(PubType::MsgPub(_)))
+                                && io_runtime.subscriptions.contains(&publisher.topic)
+                                && add_endpoint(&mut io_runtime.config.sub_connect, &publisher.address)
+                            {
+                                if let Err(error) = io_runtime.rebuild(Arc::clone(&metrics)).await {
+                                    emit_state_error(&state, &event_tx, metrics.as_ref(), None, TransportError::TemporaryTransport(format!("discovery connect failed: {error}"))).await;
+                                }
+                            }
+                        }
+                        Some(InternalIoEvent::Discovery(DiscoveryEvent::PublisherWithdrawn(publisher))) => {
+                            if remove_endpoint(&mut io_runtime.config.sub_connect, &publisher.address) {
+                                if let Err(error) = io_runtime.rebuild(Arc::clone(&metrics)).await {
+                                    emit_state_error(&state, &event_tx, metrics.as_ref(), None, TransportError::TemporaryTransport(format!("discovery disconnect failed: {error}"))).await;
+                                }
+                            }
+                        }
                         Some(InternalIoEvent::IncomingPublish { topic, payload }) => {
                             try_emit_event(
                                 &event_tx,
@@ -1145,7 +1226,7 @@ impl TransportActor {
                         }) => {
                             let mut sent = false;
                             if let Some(publisher) = io_runtime.publisher.as_mut() {
-                                match encode_publish_message(&topic, &payload) {
+                                match encode_publish_message(&topic, &payload, headers.as_ref()) {
                                     Ok(message) => match publisher.send(message).await {
                                         Ok(_) => {
                                             emit_transport_recovery(&state).await;
@@ -1392,6 +1473,18 @@ impl TransportActor {
                             }
                         }
                         Some(TxCmd::Subscribe { topic }) => {
+                            if let Some(discovery) = io_runtime.discovery_runtime.as_ref()
+                                && let Err(error) = discovery.subscribe(&topic).await
+                            {
+                                emit_state_error(
+                                    &state,
+                                    &event_tx,
+                                    metrics.as_ref(),
+                                    None,
+                                    error,
+                                )
+                                .await;
+                            }
                             if let Some(sub_cmd_tx) = io_runtime.sub_cmd_tx.as_ref() {
                                 if let Err(err) = sub_cmd_tx.try_send(SubControlCommand::Subscribe(topic.clone())) {
                                     metrics.inc_sub_cmd_full();
@@ -1717,6 +1810,21 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "network-tests")]
+    async fn shutdown_test_actor(actor: &TestActorChannels) {
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        actor
+            .control_tx
+            .send(TxCmd::Shutdown {
+                graceful: false,
+                timeout_ms: None,
+                ack: ack_tx,
+            })
+            .await
+            .expect("send shutdown");
+        assert!(matches!(ack_rx.await, Ok(Ok(()))));
+    }
+
     #[test]
     fn io_frame_publish_roundtrip_decodes_to_internal_event() {
         let frame = encode_publish_frame("telemetry/temp", b"42").expect("publish frame");
@@ -1728,6 +1836,53 @@ mod tests {
             }
             _ => panic!("expected publish event"),
         }
+    }
+
+    #[test]
+    fn legacy_pub_sub_fixture_decodes_to_internal_event() {
+        let mut message: ZmqMessage = "@/demo@/chatter".into();
+        message.push_back("tcp://192.0.2.10:34567".into());
+        message.push_back(vec![0x0a, 0x02, b'o', b'k'].into());
+        message.push_back("gz.msgs.StringMsg".into());
+
+        let event = decode_incoming_message(message).expect("decode legacy publish");
+        match event {
+            InternalIoEvent::IncomingPublish { topic, payload } => {
+                assert_eq!(topic, "@/demo@/chatter");
+                assert_eq!(payload, vec![0x0a, 0x02, b'o', b'k']);
+            }
+            _ => panic!("expected publish event"),
+        }
+    }
+
+    #[test]
+    fn legacy_publish_metadata_encodes_four_frames() {
+        let headers = MessageHeaders::from([
+            (
+                "rgz.publisher.address".to_string(),
+                "tcp://192.0.2.10:34567".to_string(),
+            ),
+            (
+                "rgz.message.type".to_string(),
+                "gz.msgs.StringMsg".to_string(),
+            ),
+        ]);
+
+        let message =
+            encode_publish_message("@/demo@/chatter", &[0x0a, 0x02, b'o', b'k'], Some(&headers))
+                .expect("encode legacy publish");
+
+        assert_eq!(message.len(), 4);
+        assert_eq!(message.get(0).expect("topic").to_vec(), b"@/demo@/chatter");
+        assert_eq!(
+            message.get(1).expect("address").to_vec(),
+            b"tcp://192.0.2.10:34567"
+        );
+        assert_eq!(
+            message.get(2).expect("payload").to_vec(),
+            [0x0a, 0x02, b'o', b'k']
+        );
+        assert_eq!(message.get(3).expect("type").to_vec(), b"gz.msgs.StringMsg");
     }
 
     #[test]
@@ -2521,6 +2676,132 @@ mod tests {
             timeout(Duration::from_secs(2), ack_rx2).await,
             Ok(Ok(Ok(())))
         ));
+    }
+
+    #[cfg(feature = "network-tests")]
+    #[tokio::test]
+    #[ignore = "requires zeromq bind/connect permissions"]
+    async fn new_publisher_delivers_legacy_multipart_layout() {
+        let endpoint = next_tcp_endpoint();
+        let config = TransportConfig {
+            enable_zeromq_io: true,
+            zeromq_pub_bind: Some(endpoint.clone()),
+            ..TransportConfig::default()
+        };
+        let (publisher, state) = spawn_with_config(config).await;
+        sleep(Duration::from_millis(200)).await;
+        if *state.lock().await == TransportState::Failed {
+            eprintln!("skipping: zeromq bind/connect not permitted in this environment");
+            return;
+        }
+
+        let mut legacy_subscriber = SubSocket::new();
+        legacy_subscriber
+            .connect(&endpoint)
+            .await
+            .expect("connect legacy subscriber");
+        legacy_subscriber
+            .subscribe("@/demo@/chatter")
+            .await
+            .expect("subscribe legacy topic");
+        sleep(Duration::from_millis(200)).await;
+
+        let headers = MessageHeaders::from([
+            ("rgz.publisher.address".to_string(), endpoint.clone()),
+            (
+                "rgz.message.type".to_string(),
+                "gz.msgs.StringMsg".to_string(),
+            ),
+        ]);
+        publisher
+            .command_tx
+            .send(TxCmd::Publish {
+                topic: "@/demo@/chatter".to_string(),
+                payload: vec![0x0a, 0x02, b'o', b'k'],
+                headers: Some(headers),
+            })
+            .await
+            .expect("publish legacy layout");
+
+        let message = timeout(Duration::from_secs(1), legacy_subscriber.recv())
+            .await
+            .expect("legacy subscriber timed out")
+            .expect("legacy subscriber receive");
+        assert_eq!(message.len(), 4);
+        assert_eq!(message.get(0).expect("topic").to_vec(), b"@/demo@/chatter");
+        assert_eq!(
+            message.get(1).expect("address").to_vec(),
+            endpoint.as_bytes()
+        );
+        assert_eq!(
+            message.get(2).expect("payload").to_vec(),
+            [0x0a, 0x02, b'o', b'k']
+        );
+        assert_eq!(message.get(3).expect("type").to_vec(), b"gz.msgs.StringMsg");
+
+        shutdown_test_actor(&publisher).await;
+    }
+
+    #[cfg(feature = "network-tests")]
+    #[tokio::test]
+    #[ignore = "requires zeromq bind/connect permissions"]
+    async fn legacy_multipart_layout_delivers_to_new_subscriber() {
+        let endpoint = next_tcp_endpoint();
+        let mut legacy_publisher = PubSocket::new();
+        if let Err(error) = legacy_publisher.bind(&endpoint).await {
+            eprintln!("skipping: zeromq bind/connect not permitted in this environment: {error}");
+            return;
+        }
+
+        let config = TransportConfig {
+            enable_zeromq_io: true,
+            zeromq_sub_connect: vec![endpoint.clone()],
+            ..TransportConfig::default()
+        };
+        let (mut subscriber, state) = spawn_with_config(config).await;
+        sleep(Duration::from_millis(200)).await;
+        if *state.lock().await == TransportState::Failed {
+            eprintln!("skipping: zeromq bind/connect not permitted in this environment");
+            return;
+        }
+
+        subscriber
+            .command_tx
+            .send(TxCmd::Subscribe {
+                topic: "@/demo@/chatter".to_string(),
+            })
+            .await
+            .expect("subscribe new actor");
+        assert!(matches!(
+            recv_until(&mut subscriber.event_rx, Duration::from_secs(1), |event| {
+                matches!(event, RxEvent::Subscribed { topic } if topic == "@/demo@/chatter")
+            })
+            .await,
+            Some(RxEvent::Subscribed { .. })
+        ));
+        sleep(Duration::from_millis(200)).await;
+
+        let mut message: ZmqMessage = "@/demo@/chatter".into();
+        message.push_back(endpoint.clone().into());
+        message.push_back(vec![0x0a, 0x02, b'o', b'k'].into());
+        message.push_back("gz.msgs.StringMsg".into());
+        legacy_publisher
+            .send(message)
+            .await
+            .expect("legacy publish");
+
+        let event = recv_until(&mut subscriber.event_rx, Duration::from_secs(1), |event| {
+            matches!(
+                event,
+                RxEvent::IncomingPublish { topic, payload, .. }
+                    if topic == "@/demo@/chatter" && payload == &vec![0x0a, 0x02, b'o', b'k']
+            )
+        })
+        .await
+        .expect("new subscriber receive legacy publication");
+        assert!(matches!(event, RxEvent::IncomingPublish { .. }));
+
+        shutdown_test_actor(&subscriber).await;
     }
 
     #[cfg(feature = "network-tests")]
