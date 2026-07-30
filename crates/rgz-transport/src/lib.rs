@@ -3,6 +3,7 @@
 pub mod actor;
 pub mod api;
 pub mod config;
+mod discovery;
 pub mod error;
 mod legacy_pubsub;
 pub mod metrics;

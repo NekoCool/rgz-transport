@@ -17,6 +17,7 @@ serde = { version = "1.0", features = ["derive"] }
 zeromq = { version = "0.5", default-features = true }
 thiserror = "1.0"
 tracing = "0.1"
+prost = "0.12"
 
 [dev-dependencies]
 tokio = { version = "1.32.0", features = ["full"] }
