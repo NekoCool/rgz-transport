@@ -16,6 +16,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant, sleep, sleep_until};
 
 use crate::config::TransportConfig;
+use crate::discovery::{DiscoveryEvent, DiscoveryRuntime};
 use crate::error::{TransportError, TransportResult};
 use crate::legacy_pubsub;
 use crate::metrics::TransportMetrics;
@@ -39,6 +40,7 @@ const IO_FRAME_REPLY: u8 = 0x03;
 
 #[derive(Debug)]
 enum InternalIoEvent {
+    Discovery(DiscoveryEvent),
     IncomingPublish {
         topic: String,
         payload: MessagePayload,
@@ -76,6 +78,7 @@ struct ActorZmqConfig {
     sub_connect: Vec<String>,
     req_bind: Option<String>,
     req_connect: Vec<String>,
+    discovery: crate::config::DiscoveryConfig,
 }
 
 impl ActorZmqConfig {
@@ -89,6 +92,7 @@ impl ActorZmqConfig {
             sub_connect: config.zeromq_sub_connect.clone(),
             req_bind: config.zeromq_req_bind.clone(),
             req_connect: config.zeromq_req_connect.clone(),
+            discovery: config.discovery.clone(),
         }
     }
 }
@@ -104,6 +108,8 @@ struct ActorZmqRuntime {
     io_event_rx: mpsc::Receiver<InternalIoEvent>,
     sub_task: Option<JoinHandle<()>>,
     req_task: Option<JoinHandle<()>>,
+    discovery_runtime: Option<DiscoveryRuntime>,
+    discovery_task: Option<JoinHandle<()>>,
 }
 
 impl ActorZmqRuntime {
@@ -122,6 +128,8 @@ impl ActorZmqRuntime {
                 io_event_rx,
                 sub_task: None,
                 req_task: None,
+                discovery_runtime: None,
+                discovery_task: None,
             });
         }
 
@@ -179,6 +187,18 @@ impl ActorZmqRuntime {
         let mut sub_task = None;
         let mut sub_cmd_tx = None;
         let mut req_task = None;
+        let (discovery_tx, mut discovery_rx) = mpsc::channel(64);
+        let discovery_runtime = DiscoveryRuntime::start(&config.discovery, discovery_tx)
+            .await
+            .map_err(|error| error.to_string())?;
+        let tx = io_event_tx.clone();
+        let discovery_task = tokio::spawn(async move {
+            while let Some(event) = discovery_rx.recv().await {
+                if tx.send(InternalIoEvent::Discovery(event)).await.is_err() {
+                    return;
+                }
+            }
+        });
 
         if let Some(mut socket) = subscriber.take() {
             let tx = io_event_tx.clone();
@@ -280,6 +300,8 @@ impl ActorZmqRuntime {
             io_event_rx,
             sub_task,
             req_task,
+            discovery_runtime: Some(discovery_runtime),
+            discovery_task: Some(discovery_task),
         })
     }
 
@@ -292,6 +314,12 @@ impl ActorZmqRuntime {
         }
         if let Some(handle) = self.req_task.take() {
             handle.abort();
+        }
+        if let Some(handle) = self.discovery_task.take() {
+            handle.abort();
+        }
+        if let Some(runtime) = self.discovery_runtime.take() {
+            runtime.stop().await;
         }
         self.publisher = None;
         self.request_send = None;
@@ -1010,6 +1038,10 @@ impl TransportActor {
                         sub_connect: Vec::new(),
                         req_bind: None,
                         req_connect: Vec::new(),
+                        discovery: crate::config::DiscoveryConfig {
+                            enabled: false,
+                            ..config.discovery.clone()
+                        },
                     },
                     Arc::clone(&metrics),
                 )
@@ -1038,6 +1070,30 @@ impl TransportActor {
                 biased;
                 io_event = io_runtime.io_event_rx.recv(), if io_runtime.is_active() => {
                     match io_event {
+                        Some(InternalIoEvent::Discovery(DiscoveryEvent::DecodeError(detail))) => {
+                            emit_state_error(
+                                &state,
+                                &event_tx,
+                                metrics.as_ref(),
+                                None,
+                                TransportError::TemporaryTransport(detail),
+                            )
+                            .await;
+                        }
+                        Some(InternalIoEvent::Discovery(DiscoveryEvent::PublisherAdvertised(publisher))) => {
+                            if io_runtime.subscriptions.contains(&publisher.topic) {
+                                add_endpoint(&mut io_runtime.config.sub_connect, &publisher.address);
+                                if let Err(error) = io_runtime.rebuild(Arc::clone(&metrics)).await {
+                                    emit_state_error(&state, &event_tx, metrics.as_ref(), None, TransportError::TemporaryTransport(format!("discovery connect failed: {error}"))).await;
+                                }
+                            }
+                        }
+                        Some(InternalIoEvent::Discovery(DiscoveryEvent::PublisherWithdrawn(publisher))) => {
+                            remove_endpoint(&mut io_runtime.config.sub_connect, &publisher.address);
+                            if let Err(error) = io_runtime.rebuild(Arc::clone(&metrics)).await {
+                                emit_state_error(&state, &event_tx, metrics.as_ref(), None, TransportError::TemporaryTransport(format!("discovery disconnect failed: {error}"))).await;
+                            }
+                        }
                         Some(InternalIoEvent::IncomingPublish { topic, payload }) => {
                             try_emit_event(
                                 &event_tx,
