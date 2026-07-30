@@ -1464,6 +1464,18 @@ impl TransportActor {
                             }
                         }
                         Some(TxCmd::Subscribe { topic }) => {
+                            if let Some(discovery) = io_runtime.discovery_runtime.as_ref()
+                                && let Err(error) = discovery.subscribe(&topic).await
+                            {
+                                emit_state_error(
+                                    &state,
+                                    &event_tx,
+                                    metrics.as_ref(),
+                                    None,
+                                    error,
+                                )
+                                .await;
+                            }
                             if let Some(sub_cmd_tx) = io_runtime.sub_cmd_tx.as_ref() {
                                 if let Err(err) = sub_cmd_tx.try_send(SubControlCommand::Subscribe(topic.clone())) {
                                     metrics.inc_sub_cmd_full();

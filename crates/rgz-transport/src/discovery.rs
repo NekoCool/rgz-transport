@@ -32,6 +32,9 @@ pub(crate) enum DiscoveryEvent {
 /// Owns the opt-in UDP multicast receive tasks for the two legacy channels.
 pub(crate) struct DiscoveryRuntime {
     tasks: Vec<JoinHandle<()>>,
+    sockets: Vec<Arc<UdpSocket>>,
+    multicast_addr: SocketAddrV4,
+    process_uuid: String,
 }
 
 impl DiscoveryRuntime {
@@ -40,7 +43,12 @@ impl DiscoveryRuntime {
         event_tx: mpsc::Sender<DiscoveryEvent>,
     ) -> Result<Self, TransportError> {
         if !config.enabled {
-            return Ok(Self { tasks: Vec::new() });
+            return Ok(Self {
+                tasks: Vec::new(),
+                sockets: Vec::new(),
+                multicast_addr: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
+                process_uuid: String::new(),
+            });
         }
 
         let multicast_ip = config.multicast_ip.parse::<Ipv4Addr>().map_err(|error| {
@@ -58,14 +66,17 @@ impl DiscoveryRuntime {
 
         let store = Arc::new(Mutex::new(DiscoveryStore::default()));
         let mut tasks = Vec::with_capacity(2);
+        let mut sockets = Vec::with_capacity(2);
         for port in [config.message_port, config.service_port] {
-            let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))
-                .await
-                .map_err(|error| {
-                    TransportError::TemporaryTransport(format!(
-                        "bind discovery UDP port {port} failed: {error}"
-                    ))
-                })?;
+            let socket = Arc::new(
+                UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))
+                    .await
+                    .map_err(|error| {
+                        TransportError::TemporaryTransport(format!(
+                            "bind discovery UDP port {port} failed: {error}"
+                        ))
+                    })?,
+            );
             socket
                 .join_multicast_v4(multicast_ip, interface_ip)
                 .map_err(|error| {
@@ -74,6 +85,7 @@ impl DiscoveryRuntime {
                     ))
                 })?;
 
+            sockets.push(Arc::clone(&socket));
             let store = Arc::clone(&store);
             let event_tx = event_tx.clone();
             tasks.push(tokio::spawn(async move {
@@ -119,7 +131,40 @@ impl DiscoveryRuntime {
                 }
             }));
         }
-        Ok(Self { tasks })
+        Ok(Self {
+            tasks,
+            sockets,
+            multicast_addr: SocketAddrV4::new(multicast_ip, config.message_port),
+            process_uuid: format!("rgz-{}", std::process::id()),
+        })
+    }
+
+    pub(crate) async fn subscribe(&self, topic: &str) -> Result<(), TransportError> {
+        if self.sockets.is_empty() {
+            return Ok(());
+        }
+        let message = Discovery {
+            version: LEGACY_DISCOVERY_WIRE_VERSION,
+            process_uuid: self.process_uuid.clone(),
+            r#type: Type::Subscribe as i32,
+            flags: None,
+            disc_contents: Some(DiscContents::Sub(discovery::Subscriber {
+                topic: topic.to_string(),
+            })),
+            header: None,
+        };
+        let datagram = encode_datagram(&message)?;
+        for socket in &self.sockets {
+            socket
+                .send_to(&datagram, self.multicast_addr)
+                .await
+                .map_err(|error| {
+                    TransportError::TemporaryTransport(format!(
+                        "send discovery subscribe failed: {error}"
+                    ))
+                })?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn stop(mut self) {
