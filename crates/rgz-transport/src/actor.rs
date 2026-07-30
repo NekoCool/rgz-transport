@@ -21,6 +21,7 @@ use crate::error::{TransportError, TransportResult};
 use crate::legacy_pubsub;
 use crate::metrics::TransportMetrics;
 use crate::state::{TransportEvent, TransportState, transition};
+use rgz_msgs::discovery::publisher::PubType;
 use tracing::warn;
 use zeromq::{DealerSendHalf, DealerSocket, PubSocket, SubSocket, ZmqMessage, prelude::*};
 
@@ -363,14 +364,19 @@ impl ActorZmqRuntime {
     }
 }
 
-fn add_endpoint(endpoints: &mut Vec<String>, endpoint: &str) {
+fn add_endpoint(endpoints: &mut Vec<String>, endpoint: &str) -> bool {
     if !endpoints.iter().any(|candidate| candidate == endpoint) {
         endpoints.push(endpoint.to_string());
+        true
+    } else {
+        false
     }
 }
 
-fn remove_endpoint(endpoints: &mut Vec<String>, endpoint: &str) {
+fn remove_endpoint(endpoints: &mut Vec<String>, endpoint: &str) -> bool {
+    let initial_len = endpoints.len();
     endpoints.retain(|candidate| candidate != endpoint);
+    endpoints.len() != initial_len
 }
 
 fn try_emit_io_event(
@@ -1081,17 +1087,20 @@ impl TransportActor {
                             .await;
                         }
                         Some(InternalIoEvent::Discovery(DiscoveryEvent::PublisherAdvertised(publisher))) => {
-                            if io_runtime.subscriptions.contains(&publisher.topic) {
-                                add_endpoint(&mut io_runtime.config.sub_connect, &publisher.address);
+                            if matches!(publisher.pub_type, Some(PubType::MsgPub(_)))
+                                && io_runtime.subscriptions.contains(&publisher.topic)
+                                && add_endpoint(&mut io_runtime.config.sub_connect, &publisher.address)
+                            {
                                 if let Err(error) = io_runtime.rebuild(Arc::clone(&metrics)).await {
                                     emit_state_error(&state, &event_tx, metrics.as_ref(), None, TransportError::TemporaryTransport(format!("discovery connect failed: {error}"))).await;
                                 }
                             }
                         }
                         Some(InternalIoEvent::Discovery(DiscoveryEvent::PublisherWithdrawn(publisher))) => {
-                            remove_endpoint(&mut io_runtime.config.sub_connect, &publisher.address);
-                            if let Err(error) = io_runtime.rebuild(Arc::clone(&metrics)).await {
-                                emit_state_error(&state, &event_tx, metrics.as_ref(), None, TransportError::TemporaryTransport(format!("discovery disconnect failed: {error}"))).await;
+                            if remove_endpoint(&mut io_runtime.config.sub_connect, &publisher.address) {
+                                if let Err(error) = io_runtime.rebuild(Arc::clone(&metrics)).await {
+                                    emit_state_error(&state, &event_tx, metrics.as_ref(), None, TransportError::TemporaryTransport(format!("discovery disconnect failed: {error}"))).await;
+                                }
                             }
                         }
                         Some(InternalIoEvent::IncomingPublish { topic, payload }) => {
