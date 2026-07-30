@@ -1,11 +1,17 @@
 //! Legacy-compatible discovery datagram codec and route store.
 
 use std::collections::HashMap;
+use std::net::{Ipv4Addr, SocketAddrV4};
+use std::sync::Arc;
 
 use prost::Message;
 use rgz_msgs::Discovery;
 use rgz_msgs::discovery::{self, DiscContents, Type};
+use tokio::net::UdpSocket;
+use tokio::sync::{Mutex, mpsc};
+use tokio::task::JoinHandle;
 
+use crate::config::DiscoveryConfig;
 use crate::error::TransportError;
 
 pub(crate) const LEGACY_DISCOVERY_WIRE_VERSION: u32 = 10;
@@ -14,6 +20,113 @@ const LENGTH_PREFIX_BYTES: usize = 2;
 #[derive(Default)]
 pub(crate) struct DiscoveryStore {
     publishers: HashMap<(String, String, String), discovery::Publisher>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum DiscoveryEvent {
+    PublisherAdvertised(discovery::Publisher),
+    PublisherWithdrawn(discovery::Publisher),
+    DecodeError(String),
+}
+
+/// Owns the opt-in UDP multicast receive tasks for the two legacy channels.
+pub(crate) struct DiscoveryRuntime {
+    tasks: Vec<JoinHandle<()>>,
+}
+
+impl DiscoveryRuntime {
+    pub(crate) async fn start(
+        config: &DiscoveryConfig,
+        event_tx: mpsc::Sender<DiscoveryEvent>,
+    ) -> Result<Self, TransportError> {
+        if !config.enabled {
+            return Ok(Self { tasks: Vec::new() });
+        }
+
+        let multicast_ip = config.multicast_ip.parse::<Ipv4Addr>().map_err(|error| {
+            TransportError::Serialization(format!("invalid discovery multicast IP: {error}"))
+        })?;
+        let interface_ip = config
+            .interface_ip
+            .as_deref()
+            .map(str::parse::<Ipv4Addr>)
+            .transpose()
+            .map_err(|error| {
+                TransportError::Serialization(format!("invalid discovery interface IP: {error}"))
+            })?
+            .unwrap_or(Ipv4Addr::UNSPECIFIED);
+
+        let store = Arc::new(Mutex::new(DiscoveryStore::default()));
+        let mut tasks = Vec::with_capacity(2);
+        for port in [config.message_port, config.service_port] {
+            let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))
+                .await
+                .map_err(|error| {
+                    TransportError::TemporaryTransport(format!(
+                        "bind discovery UDP port {port} failed: {error}"
+                    ))
+                })?;
+            socket
+                .join_multicast_v4(multicast_ip, interface_ip)
+                .map_err(|error| {
+                    TransportError::TemporaryTransport(format!(
+                        "join discovery multicast group failed: {error}"
+                    ))
+                })?;
+
+            let store = Arc::clone(&store);
+            let event_tx = event_tx.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut buffer = vec![0_u8; u16::MAX as usize];
+                loop {
+                    let received = match socket.recv_from(&mut buffer).await {
+                        Ok((received, _)) => received,
+                        Err(error) => {
+                            let _ = event_tx
+                                .send(DiscoveryEvent::DecodeError(format!(
+                                    "discovery receive failed: {error}"
+                                )))
+                                .await;
+                            break;
+                        }
+                    };
+                    match decode_datagram(&buffer[..received]) {
+                        Ok(message) => {
+                            let before = store.lock().await.apply(&message);
+                            let kind = Type::try_from(message.r#type).ok();
+                            for publisher in before {
+                                let event = match kind {
+                                    Some(Type::Advertise) => {
+                                        DiscoveryEvent::PublisherAdvertised(publisher)
+                                    }
+                                    _ => DiscoveryEvent::PublisherWithdrawn(publisher),
+                                };
+                                if event_tx.send(event).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            if event_tx
+                                .send(DiscoveryEvent::DecodeError(error.to_string()))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }));
+        }
+        Ok(Self { tasks })
+    }
+
+    pub(crate) async fn stop(mut self) {
+        for task in self.tasks.drain(..) {
+            task.abort();
+        }
+    }
 }
 
 impl DiscoveryStore {

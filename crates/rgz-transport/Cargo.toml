@@ -12,7 +12,7 @@ network-tests = []
 
 [dependencies]
 rgz-msgs = { path = "../rgz-msgs", version = "0.1.1" }
-tokio = { version = "1.32.0", features = ["rt-multi-thread", "sync", "macros", "time"] }
+tokio = { version = "1.32.0", features = ["rt-multi-thread", "sync", "macros", "time", "net"] }
 serde = { version = "1.0", features = ["derive"] }
 zeromq = { version = "0.5", default-features = true }
 thiserror = "1.0"
